@@ -1,0 +1,995 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'KBEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.customkeyboard"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.customkeyboard"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes { release { isMinifyEnabled = false } }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.1")
+          }
+          KBEOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'KBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".SettingsActivity"
+                      android:exported="true"
+                      android:label="@string/app_name">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CustomKeyboardService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_INPUT_METHOD">
+                      <intent-filter>
+                          <action android:name="android.view.InputMethod" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.view.im"
+                          android:resource="@xml/method" />
+                  </service>
+              </application>
+          </manifest>
+          KBEOF
+          mkdir -p app/src/main/java/com/example/customkeyboard
+          cat > app/src/main/java/com/example/customkeyboard/ClipboardStore.kt <<'KBEOF'
+          package com.example.customkeyboard
+
+          import android.content.Context
+          import org.json.JSONArray
+
+          /** Stores up to 30 recent clips locally in SharedPreferences. */
+          class ClipboardStore(ctx: Context) {
+              private val p = ctx.getSharedPreferences("clip", Context.MODE_PRIVATE)
+
+              fun all(): List<String> {
+                  val a = JSONArray(p.getString("items", "[]"))
+                  return (0 until a.length()).map { a.getString(it) }
+              }
+
+              fun add(text: String) {
+                  if (text.isBlank()) return
+                  val l = all().toMutableList()
+                  l.remove(text)
+                  l.add(0, text)
+                  save(l.take(30))
+              }
+
+              fun remove(text: String) = save(all().filter { it != text })
+              fun clear() = save(emptyList())
+
+              private fun save(l: List<String>) {
+                  p.edit().putString("items", JSONArray(l).toString()).apply()
+              }
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/example/customkeyboard
+          cat > app/src/main/java/com/example/customkeyboard/CustomKeyboardService.kt <<'KBEOF'
+          package com.example.customkeyboard
+
+          import android.animation.ValueAnimator
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.inputmethodservice.InputMethodService
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.text.TextUtils
+          import android.view.Gravity
+          import android.view.HapticFeedbackConstants
+          import android.view.KeyEvent
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.animation.LinearInterpolator
+          import android.view.animation.OvershootInterpolator
+          import android.view.inputmethod.EditorInfo
+          import android.widget.FrameLayout
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import java.io.File
+          import kotlin.math.PI
+          import kotlin.math.sin
+
+          class CustomKeyboardService : InputMethodService() {
+
+              private enum class Mode { KEYS, EMOJI, CLIP }
+
+              private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+              private val KB_HEIGHT = 280 // dp
+
+              private var red = Color.parseColor("#FF1744")
+              private var rainbow = false
+
+              private class GlowKey(val d: GradientDrawable, val idx: Int, val widthDp: Int)
+              private val glowKeys = mutableListOf<GlowKey>()
+              private var glowIdx = 0
+              private var glowPhase = 0f
+              private val glowAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
+                  duration = 3200
+                  repeatCount = ValueAnimator.INFINITE
+                  interpolator = LinearInterpolator()
+                  addUpdateListener { glowPhase = it.animatedValue as Float; updateGlow() }
+              }
+              private val keyFill = Color.parseColor("#CC14141C")
+              private val handler = Handler(Looper.getMainLooper())
+
+              private lateinit var prefs: SharedPreferences
+              private lateinit var store: ClipboardStore
+              private lateinit var clipboard: ClipboardManager
+
+              private var root: FrameLayout? = null
+              private var bgView: ImageView? = null
+              private var dimView: View? = null
+              private var rgbBar: RgbBarView? = null
+              private var suggestionRow: LinearLayout? = null
+              private var body: LinearLayout? = null
+
+              private var mode = Mode.KEYS
+              private var shift = false
+              private var caps = false
+              private var lastShiftTap = 0L
+              private var filipino = false
+              private var symbols = false
+              private var emojiCat = 0
+              private var bgStamp = -1L
+
+              private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
+                  val clip = clipboard.primaryClip ?: return@OnPrimaryClipChangedListener
+                  if (clip.itemCount == 0) return@OnPrimaryClipChangedListener
+                  // Skip content the source app flags as sensitive (e.g. password managers)
+                  if (android.os.Build.VERSION.SDK_INT >= 28 &&
+                      clip.description.extras?.getBoolean("android.content.extra.IS_SENSITIVE") == true)
+                      return@OnPrimaryClipChangedListener
+                  val text = clip.getItemAt(0).coerceToText(this).toString()
+                  store.add(text)
+                  if (mode == Mode.CLIP) render()
+              }
+
+              // ---------------------------------------------------------------- lifecycle
+
+              override fun onCreate() {
+                  super.onCreate()
+                  prefs = getSharedPreferences("kb", Context.MODE_PRIVATE)
+                  store = ClipboardStore(this)
+                  clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                  clipboard.addPrimaryClipChangedListener(clipListener)
+              }
+
+              override fun onDestroy() {
+                  glowAnimator.cancel()
+                  clipboard.removePrimaryClipChangedListener(clipListener)
+                  super.onDestroy()
+              }
+
+              override fun onEvaluateFullscreenMode() = false
+
+              override fun onCreateInputView(): View {
+                  val frame = FrameLayout(this).apply {
+                      setBackgroundColor(Color.parseColor("#0B0B10"))
+                      layoutParams = ViewGroup.LayoutParams(MATCH, dp(KB_HEIGHT))
+                  }
+                  root = frame
+                  bgView = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
+                  dimView = View(this)
+                  frame.addView(bgView, FrameLayout.LayoutParams(MATCH, MATCH))
+                  frame.addView(dimView, FrameLayout.LayoutParams(MATCH, MATCH))
+
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  rgbBar = RgbBarView(this)
+                  col.addView(rgbBar, LinearLayout.LayoutParams(MATCH, dp(3)))
+                  suggestionRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+                  col.addView(suggestionRow, LinearLayout.LayoutParams(MATCH, dp(38)))
+                  body = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(3), 0, dp(3), dp(4))
+                  }
+                  col.addView(body, LinearLayout.LayoutParams(MATCH, 0, 1f))
+                  frame.addView(col, FrameLayout.LayoutParams(MATCH, MATCH))
+
+                  applyPrefs()
+                  render()
+                  return frame
+              }
+
+              override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
+                  super.onStartInputView(info, restarting)
+                  mode = Mode.KEYS
+                  symbols = false
+                  caps = false
+                  shift = info != null && (currentInputConnection?.getCursorCapsMode(info.inputType) ?: 0) != 0
+                  applyPrefs()
+                  render()
+                  if (!restarting && animationsOn()) {
+                      root?.apply {
+                          alpha = 0f
+                          translationY = dp(28).toFloat()
+                          animate().alpha(1f).translationY(0f).setDuration(180).start()
+                      }
+                  }
+              }
+
+              override fun onFinishInputView(finishingInput: Boolean) {
+                  glowAnimator.cancel()
+                  super.onFinishInputView(finishingInput)
+              }
+
+              override fun onUpdateSelection(
+                  oldSelStart: Int, oldSelEnd: Int, newSelStart: Int, newSelEnd: Int,
+                  candidatesStart: Int, candidatesEnd: Int
+              ) {
+                  super.onUpdateSelection(
+                      oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd
+                  )
+                  if (mode == Mode.KEYS) updateSuggestions()
+              }
+
+              // ---------------------------------------------------------------- prefs / background
+
+              private fun animationsOn() = prefs.getBoolean("anim", true)
+
+              private fun applyPrefs() {
+                  red = prefs.getInt("accent", Color.parseColor("#FF1744"))
+                  rainbow = prefs.getBoolean("rainbow", false)
+                  rgbBar?.setPalette(red, rainbow)
+                  if (prefs.getBoolean("rgb", true) && animationsOn()) {
+                      if (!glowAnimator.isRunning) glowAnimator.start()
+                  } else {
+                      glowAnimator.cancel()
+                  }
+                  rgbBar?.visibility = if (prefs.getBoolean("rgb", true)) View.VISIBLE else View.INVISIBLE
+                  rgbBar?.setAnimated(prefs.getBoolean("rgb", true) && animationsOn())
+                  dimView?.setBackgroundColor(Color.argb(prefs.getInt("dim", 160), 0, 0, 0))
+                  val f = File(filesDir, "background.jpg")
+                  if (f.exists()) {
+                      if (f.lastModified() != bgStamp) {
+                          bgStamp = f.lastModified()
+                          bgView?.setImageBitmap(BitmapFactory.decodeFile(f.path))
+                      }
+                  } else if (bgStamp != 0L) {
+                      bgStamp = 0L
+                      bgView?.setImageDrawable(null)
+                  }
+              }
+
+              // ---------------------------------------------------------------- rendering
+
+              private fun render() {
+                  val b = body ?: return
+                  b.removeAllViews()
+                  glowKeys.clear()
+                  glowIdx = 0
+                  suggestionRow?.visibility = if (mode == Mode.KEYS) View.VISIBLE else View.GONE
+                  when (mode) {
+                      Mode.KEYS -> buildKeys(b)
+                      Mode.EMOJI -> buildEmoji(b)
+                      Mode.CLIP -> buildClip(b)
+                  }
+                  updateSuggestions()
+              }
+
+              private fun buildKeys(b: LinearLayout) {
+                  b.addView(row { "1234567890".forEach { add(charKey(it)) } }, rowLp())
+
+                  if (symbols) {
+                      b.addView(row { "@#$%&-+()/".forEach { add(charKey(it)) } }, rowLp())
+                      b.addView(row { "*\"':;!?₱€=".forEach { add(charKey(it)) } }, rowLp())
+                      b.addView(row {
+                          add(spacer(1.5f))
+                          "[]{}<>|".forEach { add(charKey(it)) }
+                          add(deleteKey())
+                      }, rowLp())
+                  } else {
+                      b.addView(row { "qwertyuiop".forEach { add(charKey(it)) } }, rowLp())
+                      if (filipino) {
+                          b.addView(row { "asdfghjklñ".forEach { add(charKey(it)) } }, rowLp())
+                      } else {
+                          b.addView(row {
+                              add(spacer(0.5f))
+                              "asdfghjkl".forEach { add(charKey(it)) }
+                              add(spacer(0.5f))
+                          }, rowLp())
+                      }
+                      b.addView(row {
+                          add(key(if (caps) "⇪" else "⇧", 1.5f, accent = shift || caps) { onShift() })
+                          "zxcvbnm".forEach { add(charKey(it)) }
+                          add(deleteKey())
+                      }, rowLp())
+                  }
+
+                  b.addView(row {
+                      add(key(if (symbols) "ABC" else "?123", 1.3f, textSize = 14f) {
+                          symbols = !symbols; render()
+                      })
+                      add(key("😊", 1f) { mode = Mode.EMOJI; render() })
+                      add(key("📋", 1f) { mode = Mode.CLIP; render() })
+                      add(key(if (filipino) "FIL" else "EN", 1.1f, textSize = 13f) {
+                          filipino = !filipino; render()
+                      })
+                      add(key(if (filipino) "Custom · FIL" else "Custom · EN", 3f, textSize = 12f, glow = true) { type(" ") })
+                      add(key(".", 1f) { type(".") })
+                      add(key("⏎", 1.4f, accent = true) { onEnter() })
+                  }, rowLp())
+              }
+
+              private fun buildEmoji(b: LinearLayout) {
+                  val tabs = row {
+                      EMOJI.forEachIndexed { i, cat ->
+                          add(key(cat.first, 1f, accent = i == emojiCat) { emojiCat = i; render() })
+                      }
+                  }
+                  b.addView(tabs, LinearLayout.LayoutParams(MATCH, dp(44)))
+
+                  val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  EMOJI[emojiCat].second.chunked(8).forEach { chunk ->
+                      val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                      for (i in 0 until 8) {
+                          val e = chunk.getOrNull(i)
+                          val tv = TextView(this).apply {
+                              text = e ?: ""
+                              textSize = 24f
+                              gravity = Gravity.CENTER
+                              if (e != null) setOnClickListener {
+                                  it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                                  pop(it)
+                                  currentInputConnection?.commitText(e, 1)
+                              }
+                          }
+                          r.addView(tv, LinearLayout.LayoutParams(0, dp(46), 1f))
+                      }
+                      list.addView(r)
+                  }
+                  val scroll = ScrollView(this).apply { addView(list) }
+                  b.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
+
+                  b.addView(row {
+                      add(key("ABC", 1.5f, textSize = 14f) { mode = Mode.KEYS; render() })
+                      add(spacer(5f))
+                      add(deleteKey(1.5f))
+                  }, LinearLayout.LayoutParams(MATCH, dp(46)))
+              }
+
+              private fun buildClip(b: LinearLayout) {
+                  b.addView(row {
+                      add(TextView(this@CustomKeyboardService).apply {
+                          text = "  CLIPBOARD"
+                          setTextColor(red)
+                          textSize = 13f
+                          gravity = Gravity.CENTER_VERTICAL
+                          typeface = android.graphics.Typeface.DEFAULT_BOLD
+                      }.also { it.layoutParams = LinearLayout.LayoutParams(0, MATCH, 4f) })
+                      add(key("Clear", 1.3f, textSize = 13f) { store.clear(); render() })
+                  }, LinearLayout.LayoutParams(MATCH, dp(44)))
+
+                  val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  val items = store.all()
+                  if (items.isEmpty()) {
+                      list.addView(TextView(this).apply {
+                          text = "Nothing copied yet.\nCopy some text and it shows up here."
+                          setTextColor(Color.LTGRAY)
+                          gravity = Gravity.CENTER
+                          setPadding(dp(8), dp(24), dp(8), dp(8))
+                      })
+                  }
+                  items.forEach { clip ->
+                      val tv = TextView(this).apply {
+                          text = clip
+                          maxLines = 2
+                          ellipsize = TextUtils.TruncateAt.END
+                          setTextColor(Color.WHITE)
+                          textSize = 14f
+                          setPadding(dp(12), dp(8), dp(12), dp(8))
+                          background = keyDrawable(false, false)
+                          setOnClickListener {
+                              it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                              pop(it)
+                              currentInputConnection?.commitText(clip, 1)
+                          }
+                          setOnLongClickListener { store.remove(clip); render(); true }
+                      }
+                      list.addView(tv, LinearLayout.LayoutParams(MATCH, ViewGroup.LayoutParams.WRAP_CONTENT)
+                          .apply { setMargins(dp(2), dp(2), dp(2), dp(2)) })
+                  }
+                  b.addView(ScrollView(this).apply { addView(list) }, LinearLayout.LayoutParams(MATCH, 0, 1f))
+
+                  b.addView(row {
+                      add(key("ABC", 1.5f, textSize = 14f) { mode = Mode.KEYS; render() })
+                      add(TextView(this@CustomKeyboardService).apply {
+                          text = "tap to paste · hold to delete"
+                          setTextColor(Color.GRAY)
+                          textSize = 11f
+                          gravity = Gravity.CENTER
+                      }.also { it.layoutParams = LinearLayout.LayoutParams(0, MATCH, 5f) })
+                      add(deleteKey(1.5f))
+                  }, LinearLayout.LayoutParams(MATCH, dp(46)))
+              }
+
+              // ---------------------------------------------------------------- key factory
+
+              private fun row(build: LinearLayout.() -> Unit): LinearLayout =
+                  LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; build() }
+
+              private fun rowLp() = LinearLayout.LayoutParams(MATCH, 0, 1f)
+
+              private fun LinearLayout.add(v: View) = addView(v)
+
+              private fun spacer(weight: Float) = View(this).apply {
+                  layoutParams = LinearLayout.LayoutParams(0, MATCH, weight)
+              }
+
+              private fun charKey(c: Char): View {
+                  val label = if (c.isLetter() && (shift || caps)) c.uppercaseChar().toString() else c.toString()
+                  return key(label) { type(c.toString()) }
+              }
+
+              private fun deleteKey(weight: Float = 1.5f) =
+                  key("⌫", weight, repeat = true) { deleteBackward() }
+
+              private fun keyDrawable(accent: Boolean, pressed: Boolean, widthDp: Int = 1) = GradientDrawable().apply {
+                  cornerRadius = dp(9).toFloat()
+                  setColor(
+                      when {
+                          pressed -> red
+                          accent -> Color.argb(110, Color.red(red), Color.green(red), Color.blue(red))
+                          else -> keyFill
+                      }
+                  )
+                  setStroke(dp(widthDp), if (accent) red else Color.argb(130, Color.red(red), Color.green(red), Color.blue(red)))
+              }
+
+              /** Animated RGB outline: a colour wave that flows across the keys. */
+              private fun glowColor(i: Int): Int {
+                  val t = glowPhase + i * 0.03f
+                  if (rainbow) return Color.HSVToColor(235, floatArrayOf((t * 360f) % 360f, 0.9f, 1f))
+                  val hsv = FloatArray(3)
+                  Color.colorToHSV(red, hsv)
+                  val wave = (sin(t * 2 * PI) * 0.5 + 0.5).toFloat()
+                  hsv[1] = (0.45f + 0.55f * wave).coerceIn(0f, 1f)
+                  hsv[2] = 0.6f + 0.4f * wave
+                  return Color.HSVToColor(235, hsv)
+              }
+
+              private fun updateGlow() {
+                  for (g in glowKeys) g.d.setStroke(dp(g.widthDp), glowColor(g.idx))
+              }
+
+              private fun key(
+                  label: String,
+                  weight: Float = 1f,
+                  accent: Boolean = false,
+                  repeat: Boolean = false,
+                  textSize: Float = 18f,
+                  glow: Boolean = false,
+                  onTap: () -> Unit
+              ): TextView {
+                  val tv = TextView(this)
+                  tv.text = label
+                  tv.gravity = Gravity.CENTER
+                  tv.setTextColor(Color.WHITE)
+                  tv.textSize = textSize
+                  tv.typeface = android.graphics.Typeface.DEFAULT_BOLD
+                  val widthDp = if (glow) 2 else 1
+                  val base = keyDrawable(accent || glow, false, widthDp)
+                  glowKeys.add(GlowKey(base, glowIdx++, widthDp))
+                  tv.background = base
+                  tv.layoutParams = LinearLayout.LayoutParams(0, MATCH, weight)
+                      .apply { setMargins(dp(2), dp(2), dp(2), dp(2)) }
+
+                  val repeater = object : Runnable {
+                      override fun run() { onTap(); handler.postDelayed(this, 45) }
+                  }
+                  tv.setOnTouchListener { v, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              v.background = keyDrawable(accent, true, widthDp)
+                              if (animationsOn()) v.animate().scaleX(0.9f).scaleY(0.9f).setDuration(60).start()
+                              v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                              onTap()
+                              if (repeat) handler.postDelayed(repeater, 380)
+                          }
+                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                              handler.removeCallbacks(repeater)
+                              v.background = base
+                              if (animationsOn()) {
+                                  v.animate().scaleX(1f).scaleY(1f).setDuration(140)
+                                      .setInterpolator(OvershootInterpolator(3f)).start()
+                              }
+                          }
+                      }
+                      true
+                  }
+                  return tv
+              }
+
+              private fun pop(v: View) {
+                  if (!animationsOn()) return
+                  v.animate().scaleX(0.8f).scaleY(0.8f).setDuration(60).withEndAction {
+                      v.animate().scaleX(1f).scaleY(1f).setDuration(140)
+                          .setInterpolator(OvershootInterpolator(3f)).start()
+                  }.start()
+              }
+
+              // ---------------------------------------------------------------- input actions
+
+              private fun type(s: String) {
+                  val out = if (shift || caps) s.uppercase() else s
+                  currentInputConnection?.commitText(out, 1)
+                  if (shift && !caps) { shift = false; render() } else updateSuggestions()
+              }
+
+              private fun deleteBackward() {
+                  val ic = currentInputConnection ?: return
+                  if (!ic.getSelectedText(0).isNullOrEmpty()) ic.commitText("", 1)
+                  else sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+              }
+
+              private fun onShift() {
+                  val now = SystemClock.uptimeMillis()
+                  when {
+                      caps -> { caps = false; shift = false }
+                      shift && now - lastShiftTap < 350 -> caps = true
+                      else -> shift = !shift
+                  }
+                  lastShiftTap = now
+                  render()
+              }
+
+              private fun onEnter() {
+                  val ei = currentInputEditorInfo
+                  val action = ei?.imeOptions?.and(EditorInfo.IME_MASK_ACTION) ?: EditorInfo.IME_ACTION_NONE
+                  val noAction = ei == null ||
+                      (ei.imeOptions and EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0 ||
+                      action == EditorInfo.IME_ACTION_NONE || action == EditorInfo.IME_ACTION_UNSPECIFIED
+                  if (noAction) sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+                  else currentInputConnection?.performEditorAction(action)
+              }
+
+              // ---------------------------------------------------------------- suggestions
+
+              private fun updateSuggestions() {
+                  val row = suggestionRow ?: return
+                  row.removeAllViews()
+                  if (mode != Mode.KEYS) return
+                  val before = currentInputConnection?.getTextBeforeCursor(30, 0)?.toString().orEmpty()
+                  val word = before.takeLastWhile { it.isLetter() }
+                  val pool = if (filipino) FIL_WORDS + EN_WORDS else EN_WORDS + FIL_WORDS
+                  val list = if (word.isEmpty()) {
+                      if (filipino) listOf("po", "opo", "salamat") else listOf("I", "the", "and")
+                  } else {
+                      pool.filter { it.startsWith(word, true) && !it.equals(word, true) }.distinct().take(3)
+                  }
+                  val capitalize = word.firstOrNull()?.isUpperCase() == true
+                  list.forEachIndexed { i, s ->
+                      val shown = if (capitalize) s.replaceFirstChar { it.uppercase() } else s
+                      row.addView(TextView(this).apply {
+                          text = shown
+                          setTextColor(Color.WHITE)
+                          textSize = 15f
+                          gravity = Gravity.CENTER
+                          setOnClickListener {
+                              val ic = currentInputConnection ?: return@setOnClickListener
+                              ic.deleteSurroundingText(word.length, 0)
+                              ic.commitText("$shown ", 1)
+                          }
+                      }, LinearLayout.LayoutParams(0, MATCH, 1f))
+                      if (i < list.size - 1) {
+                          row.addView(View(this).apply { setBackgroundColor(Color.argb(90, 255, 23, 68)) },
+                              LinearLayout.LayoutParams(dp(1), dp(18)))
+                      }
+                  }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              companion object {
+                  val EMOJI = listOf(
+                      "😀" to ("😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😛 😜 🤪 😎 🤩 🥳 😏 😒 " +
+                          "😞 😔 😢 😭 😤 😠 😡 🤬 🤯 😳 🥵 🥶 😱 😨 🤔 🤫 🙄 😴 🤤 😷 🤒 🤡 👻 😈").split(" "),
+                      "🎮" to ("🎮 🕹️ 👾 🔥 ⚡ 💀 👑 🏆 🎯 💎 🚀 💥 ⚔️ 🛡️ 🎧 🖥️ ⌨️ 🖱️ 🏅 🥇 🎲 🧩 💣 " +
+                          "🌟 ✨ 🎉 🎊 💯 🆗 🆒 🔊 📱 💻 🤖 👽 ☠️ 🩸 🔴 🟥").split(" "),
+                      "❤️" to ("❤️ 🧡 💛 💚 💙 💜 🖤 🤍 💔 ❣️ 💕 💖 👍 👎 👊 ✊ 👏 🙌 🙏 💪 ✌️ 🤞 🤟 🤘 " +
+                          "👌 👋 🤝 🫶 🫡 👀 🧠 🫠").split(" "),
+                      "🇵🇭" to ("🇵🇭 🥭 🍚 🍜 🌴 🏝️ 🛺 🌞 🌊 🥥 🍌 🐃 🦜 ☀️ 🌈 🍗 🍖 🥟 🍧 🧋 ⛱️ 🏖️ 🎤 🎶").split(" ")
+                  )
+
+                  val EN_WORDS = ("the and you that have for not with this but from they will would there their " +
+                      "what about which when make can like time just know take people into year your good some " +
+                      "could them see other than then now look only come its over think also back after use two " +
+                      "how our work first well way even new want because any these give day most us hello " +
+                      "thanks please game gaming play win lose team ranked " +
+                      "going being really right still every great where much before never another while " +
+                      "should those through between during without again against always something nothing " +
+                      "everything someone everyone people little different important another though already " +
+                      "message tomorrow today tonight yesterday morning afternoon evening friend family " +
+                      "online offline server lobby squad match round level score player victory defeat " +
+                      "stream clutch noob legend epic awesome amazing sorry welcome congratulations").split(" ")
+
+                  val FIL_WORDS = ("po opo salamat kumusta mabuhay magandang umaga hapon gabi ako ikaw siya kami " +
+                      "tayo kayo sila ano bakit saan kailan paano sino oo hindi wala mayroon gusto ayaw mahal " +
+                      "kita sige pasensya paalam kain tulog laro kaibigan pamilya bahay trabaho eskwela ngayon " +
+                      "bukas kahapon talaga naman lang din rin pa na ba ng mga sa ang yung ito iyon dito doon " +
+                      "tara galing ingat pasalubong kuya ate nanay tatay pwede puwede ganda masaya malungkot " +
+                      "gutom pagod nakakatuwa nakakainis pasensiya maraming walang anuman kamusta mabait " +
+                      "magaling mahusay paumanhin sandali teka hintay saglit bilis bilisan dali pasok uwi alis " +
+                      "balik punta sama kasama samahan tulong tulungan salamat-po mamaya kanina agad lagi minsan " +
+                      "kahit pero kasi kaya dahil habang bago pagkatapos tapos simula hanggang para sana siguro " +
+                      "baka marami kaunti konti sobra masyado talagang tunay totoo pangalan edad lugar pera " +
+                      "kuwarta pagkain tubig kape gatas ulam kanin almusal tanghalian hapunan meryenda " +
+                      "pinoy pilipino pilipinas maynila cebu davao laban panalo talo kalaban koponan " +
+                      "manlalaro sigaw tawa iyak ngiti halik yakap").split(" ")
+              }
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/example/customkeyboard
+          cat > app/src/main/java/com/example/customkeyboard/RgbBarView.kt <<'KBEOF'
+          package com.example.customkeyboard
+
+          import android.animation.ValueAnimator
+          import android.content.Context
+          import android.graphics.*
+          import android.view.View
+          import android.view.animation.LinearInterpolator
+
+          /** Thin animated strip that flows through red RGB shades. */
+          class RgbBarView(ctx: Context) : View(ctx) {
+              private val paint = Paint()
+              private val matrix = Matrix()
+              private var shader: LinearGradient? = null
+              private var phase = 0f
+              private var wantAnim = true
+
+              private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
+                  duration = 2600
+                  repeatCount = ValueAnimator.INFINITE
+                  interpolator = LinearInterpolator()
+                  addUpdateListener { phase = it.animatedValue as Float; invalidate() }
+              }
+
+              fun setAnimated(on: Boolean) {
+                  wantAnim = on
+                  if (on && isAttachedToWindow) animator.start() else animator.cancel()
+                  invalidate()
+              }
+
+              private var colors = intArrayOf(
+                  Color.parseColor("#FF1744"), Color.parseColor("#FF5252"),
+                  Color.parseColor("#D50000"), Color.parseColor("#FF4081"),
+                  Color.parseColor("#FF1744")
+              )
+
+              /** Red-family flow for the chosen accent, or a full RGB rainbow. */
+              fun setPalette(accent: Int, rainbow: Boolean) {
+                  colors = if (rainbow) {
+                      intArrayOf(Color.RED, Color.YELLOW, Color.GREEN, Color.CYAN, Color.BLUE, Color.MAGENTA, Color.RED)
+                  } else {
+                      val hsv = FloatArray(3)
+                      Color.colorToHSV(accent, hsv)
+                      fun variant(dh: Float, ds: Float, dv: Float) = Color.HSVToColor(
+                          floatArrayOf((hsv[0] + dh + 360f) % 360f, (hsv[1] * ds).coerceIn(0f, 1f), (hsv[2] * dv).coerceIn(0f, 1f))
+                      )
+                      intArrayOf(accent, variant(0f, 0.65f, 1f), variant(0f, 1f, 0.7f), variant(14f, 1f, 1f), accent)
+                  }
+                  rebuild()
+              }
+
+              private fun rebuild() {
+                  if (width == 0) return
+                  shader = LinearGradient(0f, 0f, width.toFloat(), 0f, colors, null, Shader.TileMode.REPEAT)
+                  paint.shader = shader
+                  invalidate()
+              }
+
+              override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) = rebuild()
+
+              override fun onDraw(canvas: Canvas) {
+                  matrix.setTranslate(phase * width, 0f)
+                  shader?.setLocalMatrix(matrix)
+                  canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
+              }
+
+              override fun onAttachedToWindow() {
+                  super.onAttachedToWindow()
+                  if (wantAnim) animator.start()
+              }
+
+              override fun onDetachedFromWindow() {
+                  animator.cancel()
+                  super.onDetachedFromWindow()
+              }
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/example/customkeyboard
+          cat > app/src/main/java/com/example/customkeyboard/SettingsActivity.kt <<'KBEOF'
+          package com.example.customkeyboard
+
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+          import java.io.File
+
+          class SettingsActivity : ComponentActivity() {
+
+              private val red = Color.parseColor("#FF1744")
+
+              private val picker =
+                  registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                      if (uri != null) saveBackground(uri)
+                  }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("kb", Context.MODE_PRIVATE)
+
+                  val col = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(40), dp(20), dp(24))
+                  }
+
+                  col.addView(TextView(this).apply {
+                      text = "CUSTOM KEYBOARD"
+                      setTextColor(red)
+                      textSize = 26f
+                      typeface = android.graphics.Typeface.DEFAULT_BOLD
+                      letterSpacing = 0.12f
+                  })
+                  col.addView(label("RGB gaming keyboard · English + Filipino"))
+
+                  col.addView(section("1 · Set up"))
+                  col.addView(button("Enable keyboard") {
+                      startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+                  })
+                  col.addView(button("Switch to Custom Keyboard") {
+                      (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+                          .showInputMethodPicker()
+                  })
+
+                  col.addView(section("2 · Look"))
+                  col.addView(button("Choose background image") {
+                      picker.launch(arrayOf("image/*"))
+                  })
+                  col.addView(button("Remove background") {
+                      File(filesDir, "background.jpg").delete()
+                      toast("Background removed")
+                  })
+                  col.addView(label("Background dimming"))
+                  col.addView(SeekBar(this).apply {
+                      max = 230
+                      progress = prefs.getInt("dim", 160)
+                      progressTintList = android.content.res.ColorStateList.valueOf(red)
+                      thumbTintList = android.content.res.ColorStateList.valueOf(red)
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(s: SeekBar?, v: Int, fromUser: Boolean) {
+                              prefs.edit().putInt("dim", v).apply()
+                          }
+                          override fun onStartTrackingTouch(s: SeekBar?) {}
+                          override fun onStopTrackingTouch(s: SeekBar?) {}
+                      })
+                  })
+                  col.addView(toggle("RGB light bar", prefs.getBoolean("rgb", true)) {
+                      prefs.edit().putBoolean("rgb", it).apply()
+                  })
+                  col.addView(toggle("Animations", prefs.getBoolean("anim", true)) {
+                      prefs.edit().putBoolean("anim", it).apply()
+                  })
+
+                  col.addView(label("Accent color"))
+                  col.addView(LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      listOf("#FF1744", "#FF3D00", "#FF4081", "#D50000").forEach { hex ->
+                          addView(View(this@SettingsActivity).apply {
+                              background = GradientDrawable().apply {
+                                  shape = GradientDrawable.OVAL
+                                  setColor(Color.parseColor(hex))
+                              }
+                              setOnClickListener {
+                                  prefs.edit().putInt("accent", Color.parseColor(hex)).apply()
+                                  toast("Accent updated")
+                              }
+                          }, LinearLayout.LayoutParams(dp(46), dp(46)).apply { rightMargin = dp(14) })
+                      }
+                  })
+                  col.addView(toggle("Full RGB rainbow mode", prefs.getBoolean("rainbow", false)) {
+                      prefs.edit().putBoolean("rainbow", it).apply()
+                  })
+
+                  col.addView(section("3 · Try it"))
+                  col.addView(EditText(this).apply {
+                      hint = "Tap here to test the keyboard"
+                      setHintTextColor(Color.GRAY)
+                      setTextColor(Color.WHITE)
+                  })
+
+                  setContentView(ScrollView(this).apply {
+                      setBackgroundColor(Color.parseColor("#0B0B10"))
+                      addView(col)
+                  })
+              }
+
+              private fun saveBackground(uri: Uri) {
+                  try {
+                      val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                      contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+                      var sample = 1
+                      while (bounds.outWidth / sample > 1600) sample *= 2
+                      val bmp = contentResolver.openInputStream(uri)?.use {
+                          BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+                      } ?: return toast("Couldn't read that image")
+                      File(filesDir, "background.jpg").outputStream().use {
+                          bmp.compress(Bitmap.CompressFormat.JPEG, 88, it)
+                      }
+                      toast("Background saved")
+                  } catch (e: Exception) {
+                      toast("Couldn't load that image")
+                  }
+              }
+
+              // ---- small UI helpers
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+              private fun label(t: String) = TextView(this).apply {
+                  text = t; setTextColor(Color.LTGRAY); textSize = 14f
+                  setPadding(0, dp(6), 0, dp(6))
+              }
+
+              private fun section(t: String) = TextView(this).apply {
+                  text = t; setTextColor(red); textSize = 16f
+                  typeface = android.graphics.Typeface.DEFAULT_BOLD
+                  setPadding(0, dp(24), 0, dp(6))
+              }
+
+              private fun button(t: String, onClick: () -> Unit) = Button(this).apply {
+                  text = t
+                  setTextColor(Color.WHITE)
+                  isAllCaps = false
+                  background = GradientDrawable().apply {
+                      cornerRadius = dp(10).toFloat()
+                      setColor(Color.parseColor("#1A1A22"))
+                      setStroke(dp(1), red)
+                  }
+                  layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50))
+                      .apply { topMargin = dp(8) }
+                  setOnClickListener { onClick() }
+              }
+
+              private fun toggle(t: String, on: Boolean, onChange: (Boolean) -> Unit) = Switch(this).apply {
+                  text = t
+                  isChecked = on
+                  setTextColor(Color.WHITE)
+                  gravity = Gravity.CENTER_VERTICAL
+                  setPadding(0, dp(12), 0, dp(12))
+                  setOnCheckedChangeListener { _, v -> onChange(v) }
+              }
+          }
+          KBEOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'KBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="96dp" android:height="96dp"
+              android:viewportWidth="96" android:viewportHeight="96">
+              <path android:fillColor="#0B0B10" android:pathData="M18,0h60a18,18 0 0 1 18,18v60a18,18 0 0 1 -18,18h-60a18,18 0 0 1 -18,-18v-60a18,18 0 0 1 18,-18z"/>
+              <path android:strokeColor="#FF1744" android:strokeWidth="4" android:fillColor="#00000000"
+                  android:pathData="M16,30h64a4,4 0 0 1 4,4v28a4,4 0 0 1 -4,4h-64a4,4 0 0 1 -4,-4v-28a4,4 0 0 1 4,-4z"/>
+              <path android:fillColor="#FF1744" android:pathData="M22,38h8v8h-8z M36,38h8v8h-8z M50,38h8v8h-8z M64,38h8v8h-8z M28,52h40v8h-40z"/>
+          </vector>
+          KBEOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'KBEOF'
+          <resources>
+              <string name="app_name">Custom Keyboard</string>
+          </resources>
+          KBEOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/method.xml <<'KBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <input-method xmlns:android="http://schemas.android.com/apk/res/android"
+              android:settingsActivity="com.example.customkeyboard.SettingsActivity" />
+          KBEOF
+          cat > build.gradle.kts <<'KBEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          KBEOF
+          cat > gradle.properties <<'KBEOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          KBEOF
+          cat > settings.gradle.kts <<'KBEOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "CustomKeyboard"
+          include(":app")
+          KBEOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CustomKeyboard-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
