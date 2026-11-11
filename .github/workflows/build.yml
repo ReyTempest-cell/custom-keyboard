@@ -51,6 +51,11 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission
+                  android:name="android.permission.READ_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="32" />
+
               <application
                   android:allowBackup="false"
                   android:icon="@drawable/ic_launcher"
@@ -79,6 +84,16 @@ jobs:
                           android:name="android.view.im"
                           android:resource="@xml/method" />
                   </service>
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="com.example.customkeyboard.files"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
               </application>
           </manifest>
           KBEOF
@@ -88,9 +103,10 @@ jobs:
 
           import android.content.Context
           import org.json.JSONArray
+          import java.io.File
 
-          /** Stores up to 30 recent clips locally in SharedPreferences. */
-          class ClipboardStore(ctx: Context) {
+          /** Stores up to 30 recent clips. Image clips are saved as "IMG:<filename>". */
+          class ClipboardStore(private val ctx: Context) {
               private val p = ctx.getSharedPreferences("clip", Context.MODE_PRIVATE)
 
               fun all(): List<String> {
@@ -98,16 +114,28 @@ jobs:
                   return (0 until a.length()).map { a.getString(it) }
               }
 
-              fun add(text: String) {
-                  if (text.isBlank()) return
+              fun add(item: String) {
+                  if (item.isBlank()) return
                   val l = all().toMutableList()
-                  l.remove(text)
-                  l.add(0, text)
+                  l.remove(item)
+                  l.add(0, item)
+                  l.drop(30).forEach { deleteFile(it) }
                   save(l.take(30))
               }
 
-              fun remove(text: String) = save(all().filter { it != text })
-              fun clear() = save(emptyList())
+              fun remove(item: String) {
+                  deleteFile(item)
+                  save(all().filter { it != item })
+              }
+
+              fun clear() {
+                  all().forEach { deleteFile(it) }
+                  save(emptyList())
+              }
+
+              private fun deleteFile(item: String) {
+                  if (item.startsWith("IMG:")) File(ImageShare.dir(ctx), item.removePrefix("IMG:")).delete()
+              }
 
               private fun save(l: List<String>) {
                   p.edit().putString("items", JSONArray(l).toString()).apply()
@@ -119,16 +147,26 @@ jobs:
           package com.example.customkeyboard
 
           import android.animation.ValueAnimator
+          import android.content.ClipData
           import android.content.ClipboardManager
+          import android.content.ContentUris
           import android.content.Context
+          import android.content.Intent
           import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
           import android.graphics.BitmapFactory
           import android.graphics.Color
+          import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
           import android.inputmethodservice.InputMethodService
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.os.Build
           import android.os.Handler
           import android.os.Looper
           import android.os.SystemClock
+          import android.provider.MediaStore
           import android.text.TextUtils
           import android.view.Gravity
           import android.view.HapticFeedbackConstants
@@ -142,38 +180,46 @@ jobs:
           import android.widget.FrameLayout
           import android.widget.ImageView
           import android.widget.LinearLayout
+          import android.widget.PopupWindow
           import android.widget.ScrollView
           import android.widget.TextView
+          import android.widget.Toast
+          import androidx.core.content.FileProvider
+          import androidx.core.graphics.ColorUtils
           import java.io.File
+          import java.util.concurrent.Executors
           import kotlin.math.PI
           import kotlin.math.sin
 
           class CustomKeyboardService : InputMethodService() {
 
-              private enum class Mode { KEYS, EMOJI, CLIP }
+              private enum class Mode { KEYS, EMOJI, CLIP, TOOLS, IMAGES }
 
               private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
-              private val KB_HEIGHT = 280 // dp
+              private val KB_HEIGHT = 290 // dp
 
               private var red = Color.parseColor("#FF1744")
-              private var rainbow = false
+              private val blue = Color.parseColor("#2979FF")
+              private var palette = 1 // 0 = red, 1 = red & blue, 2 = rainbow
+              private val keyFill = Color.parseColor("#CC14141C")
+              private val handler = Handler(Looper.getMainLooper())
+              private val io = Executors.newSingleThreadExecutor()
 
-              private class GlowKey(val d: GradientDrawable, val idx: Int, val widthDp: Int)
+              private class GlowKey(val d: GlowDrawable, val idx: Int)
               private val glowKeys = mutableListOf<GlowKey>()
               private var glowIdx = 0
               private var glowPhase = 0f
               private val glowAnimator = ValueAnimator.ofFloat(0f, 1f).apply {
-                  duration = 3200
+                  duration = 2400
                   repeatCount = ValueAnimator.INFINITE
                   interpolator = LinearInterpolator()
                   addUpdateListener { glowPhase = it.animatedValue as Float; updateGlow() }
               }
-              private val keyFill = Color.parseColor("#CC14141C")
-              private val handler = Handler(Looper.getMainLooper())
 
               private lateinit var prefs: SharedPreferences
               private lateinit var store: ClipboardStore
               private lateinit var clipboard: ClipboardManager
+              private lateinit var audio: AudioManager
 
               private var root: FrameLayout? = null
               private var bgView: ImageView? = null
@@ -181,6 +227,7 @@ jobs:
               private var rgbBar: RgbBarView? = null
               private var suggestionRow: LinearLayout? = null
               private var body: LinearLayout? = null
+              private var altPopup: PopupWindow? = null
 
               private var mode = Mode.KEYS
               private var shift = false
@@ -190,16 +237,36 @@ jobs:
               private var symbols = false
               private var emojiCat = 0
               private var bgStamp = -1L
+              private var oneHand = 0 // 0 = full, 1 = left, 2 = right
+              private var allPhotos = false
+              private var ignoreClipUntil = 0L
+
+              private val ALTS = mapOf(
+                  'a' to "àáâäãåā", 'e' to "èéêëēė", 'i' to "ìíîïī", 'o' to "òóôöõō",
+                  'u' to "ùúûüū", 'n' to "ñ", 'c' to "ç", 's' to "ßś", 'y' to "ýÿ", 'z' to "žź"
+              )
 
               private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
+                  if (SystemClock.uptimeMillis() < ignoreClipUntil) return@OnPrimaryClipChangedListener
                   val clip = clipboard.primaryClip ?: return@OnPrimaryClipChangedListener
                   if (clip.itemCount == 0) return@OnPrimaryClipChangedListener
                   // Skip content the source app flags as sensitive (e.g. password managers)
-                  if (android.os.Build.VERSION.SDK_INT >= 28 &&
+                  if (Build.VERSION.SDK_INT >= 28 &&
                       clip.description.extras?.getBoolean("android.content.extra.IS_SENSITIVE") == true)
                       return@OnPrimaryClipChangedListener
-                  val text = clip.getItemAt(0).coerceToText(this).toString()
-                  store.add(text)
+                  val item = clip.getItemAt(0)
+                  val desc = clip.description
+                  val imgMime = (0 until desc.mimeTypeCount).map { desc.getMimeType(it) }
+                      .firstOrNull { it.startsWith("image/") }
+                  val uri = item.uri
+                  if (uri != null && imgMime != null) {
+                      var ext = imgMime.substringAfter('/').replace("jpeg", "jpg")
+                      if (ext !in listOf("png", "jpg", "gif", "webp")) ext = "png"
+                      val name = "clip_${System.currentTimeMillis()}.$ext"
+                      if (ImageShare.copyToShared(this, uri, name) != null) store.add("IMG:$name")
+                  } else {
+                      store.add(item.coerceToText(this).toString())
+                  }
                   if (mode == Mode.CLIP) render()
               }
 
@@ -209,12 +276,14 @@ jobs:
                   super.onCreate()
                   prefs = getSharedPreferences("kb", Context.MODE_PRIVATE)
                   store = ClipboardStore(this)
+                  audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
                   clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                   clipboard.addPrimaryClipChangedListener(clipListener)
               }
 
               override fun onDestroy() {
                   glowAnimator.cancel()
+                  io.shutdown()
                   clipboard.removePrimaryClipChangedListener(clipListener)
                   super.onDestroy()
               }
@@ -233,16 +302,13 @@ jobs:
 
                   val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                   rgbBar = RgbBarView(this)
-                  col.addView(rgbBar, LinearLayout.LayoutParams(MATCH, dp(3)))
+                  col.addView(rgbBar, LinearLayout.LayoutParams(MATCH, dp(4)))
                   suggestionRow = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
                   }
                   col.addView(suggestionRow, LinearLayout.LayoutParams(MATCH, dp(38)))
-                  body = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      setPadding(dp(3), 0, dp(3), dp(4))
-                  }
+                  body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                   col.addView(body, LinearLayout.LayoutParams(MATCH, 0, 1f))
                   frame.addView(col, FrameLayout.LayoutParams(MATCH, MATCH))
 
@@ -270,6 +336,7 @@ jobs:
 
               override fun onFinishInputView(finishingInput: Boolean) {
                   glowAnimator.cancel()
+                  dismissAlt()
                   super.onFinishInputView(finishingInput)
               }
 
@@ -289,8 +356,9 @@ jobs:
 
               private fun applyPrefs() {
                   red = prefs.getInt("accent", Color.parseColor("#FF1744"))
-                  rainbow = prefs.getBoolean("rainbow", false)
-                  rgbBar?.setPalette(red, rainbow)
+                  palette = prefs.getInt("palette", 1)
+                  oneHand = prefs.getInt("onehand", 0)
+                  rgbBar?.setPalette(red, palette)
                   if (prefs.getBoolean("rgb", true) && animationsOn()) {
                       if (!glowAnimator.isRunning) glowAnimator.start()
                   } else {
@@ -315,14 +383,22 @@ jobs:
 
               private fun render() {
                   val b = body ?: return
+                  dismissAlt()
                   b.removeAllViews()
                   glowKeys.clear()
                   glowIdx = 0
+                  val side = (resources.displayMetrics.widthPixels * 0.2f).toInt()
+                  b.setPadding(
+                      dp(3) + if (oneHand == 2) side else 0, 0,
+                      dp(3) + if (oneHand == 1) side else 0, dp(4)
+                  )
                   suggestionRow?.visibility = if (mode == Mode.KEYS) View.VISIBLE else View.GONE
                   when (mode) {
                       Mode.KEYS -> buildKeys(b)
                       Mode.EMOJI -> buildEmoji(b)
                       Mode.CLIP -> buildClip(b)
+                      Mode.TOOLS -> buildTools(b)
+                      Mode.IMAGES -> buildImages(b)
                   }
                   updateSuggestions()
               }
@@ -366,9 +442,97 @@ jobs:
                           filipino = !filipino; render()
                       })
                       add(key(if (filipino) "Custom · FIL" else "Custom · EN", 3f, textSize = 12f, glow = true) { type(" ") })
-                      add(key(".", 1f) { type(".") })
+                      add(key(".", 1f, alts = ",?!'\":;-") { type(".") })
                       add(key("⏎", 1.4f, accent = true) { onEnter() })
                   }, rowLp())
+              }
+
+              private fun buildTools(b: LinearLayout) {
+                  b.addView(row {
+                      add(key("🖼\nImages", 1f, textSize = 13f) { mode = Mode.IMAGES; render() })
+                      add(key("📋\nClipboard", 1f, textSize = 13f) { mode = Mode.CLIP; render() })
+                      add(key("😊\nEmoji", 1f, textSize = 13f) { mode = Mode.EMOJI; render() })
+                      add(key("⚙\nSettings", 1f, textSize = 13f) { openSettings() })
+                  }, rowLp())
+                  b.addView(row {
+                      add(key("Select\nall", 1f, textSize = 13f) { menuAction(android.R.id.selectAll) })
+                      add(key("Cut", 1f, textSize = 14f) { menuAction(android.R.id.cut) })
+                      add(key("Copy", 1f, textSize = 14f) { menuAction(android.R.id.copy) })
+                      add(key("Paste", 1f, textSize = 14f) { menuAction(android.R.id.paste) })
+                  }, rowLp())
+                  b.addView(row {
+                      add(key("◀", 1f, repeat = true) { sendDownUpKeyEvents(KeyEvent.KEYCODE_DPAD_LEFT) })
+                      add(key("▶", 1f, repeat = true) { sendDownUpKeyEvents(KeyEvent.KEYCODE_DPAD_RIGHT) })
+                      add(key("◧\nLeft hand", 1f, accent = oneHand == 1, textSize = 12f) { setOneHand(1) })
+                      add(key("◨\nRight hand", 1f, accent = oneHand == 2, textSize = 12f) { setOneHand(2) })
+                  }, rowLp())
+                  val soundOn = prefs.getBoolean("sound", false)
+                  b.addView(row {
+                      add(key("Full\nwidth", 1f, accent = oneHand == 0, textSize = 12f) { setOneHand(0) })
+                      add(key(if (soundOn) "🔊\nSound on" else "🔇\nSound off", 1f, textSize = 12f) {
+                          prefs.edit().putBoolean("sound", !soundOn).apply(); render()
+                      })
+                      add(key("ABC", 2f, accent = true, textSize = 15f) { mode = Mode.KEYS; render() })
+                  }, rowLp())
+              }
+
+              private fun buildImages(b: LinearLayout) {
+                  b.addView(row {
+                      add(key("📸 Screenshots", 2f, accent = !allPhotos, textSize = 12f) { allPhotos = false; render() })
+                      add(key("🖼 Recent", 2f, accent = allPhotos, textSize = 12f) { allPhotos = true; render() })
+                  }, LinearLayout.LayoutParams(MATCH, dp(44)))
+
+                  val bottom = row {
+                      add(key("ABC", 1.5f, textSize = 14f) { mode = Mode.KEYS; render() })
+                      add(spacer(4f))
+                  }
+
+                  if (!hasMediaPermission()) {
+                      b.addView(TextView(this).apply {
+                          text = "Allow photo access to send screenshots from here."
+                          setTextColor(Color.LTGRAY)
+                          gravity = Gravity.CENTER
+                      }, LinearLayout.LayoutParams(MATCH, 0, 1f))
+                      bottom.addView(key("Open settings", 3f, accent = true, textSize = 13f) { openSettings() })
+                      b.addView(bottom, LinearLayout.LayoutParams(MATCH, dp(46)))
+                      return
+                  }
+
+                  val uris = recentImages(allPhotos, 24)
+                  if (uris.isEmpty()) {
+                      b.addView(TextView(this).apply {
+                          text = if (allPhotos) "No photos found." else "No screenshots found."
+                          setTextColor(Color.LTGRAY)
+                          gravity = Gravity.CENTER
+                      }, LinearLayout.LayoutParams(MATCH, 0, 1f))
+                  } else {
+                      val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                      uris.chunked(4).forEach { chunk ->
+                          val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                          for (i in 0 until 4) {
+                              val uri = chunk.getOrNull(i)
+                              val iv = ImageView(this).apply {
+                                  scaleType = ImageView.ScaleType.CENTER_CROP
+                                  setBackgroundColor(Color.parseColor("#22FFFFFF"))
+                                  if (uri != null) setOnClickListener { pop(it); sendImage(uri) }
+                              }
+                              if (uri != null) {
+                                  io.execute {
+                                      val bm = decodeThumb(uri, 260)
+                                      if (bm != null) handler.post { iv.setImageBitmap(bm) }
+                                  }
+                              } else {
+                                  iv.setBackgroundColor(Color.TRANSPARENT)
+                              }
+                              r.addView(iv, LinearLayout.LayoutParams(0, dp(78), 1f).apply {
+                                  setMargins(dp(2), dp(2), dp(2), dp(2))
+                              })
+                          }
+                          list.addView(r)
+                      }
+                      b.addView(ScrollView(this).apply { addView(list) }, LinearLayout.LayoutParams(MATCH, 0, 1f))
+                  }
+                  b.addView(bottom, LinearLayout.LayoutParams(MATCH, dp(46)))
               }
 
               private fun buildEmoji(b: LinearLayout) {
@@ -398,8 +562,7 @@ jobs:
                       }
                       list.addView(r)
                   }
-                  val scroll = ScrollView(this).apply { addView(list) }
-                  b.addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
+                  b.addView(ScrollView(this).apply { addView(list) }, LinearLayout.LayoutParams(MATCH, 0, 1f))
 
                   b.addView(row {
                       add(key("ABC", 1.5f, textSize = 14f) { mode = Mode.KEYS; render() })
@@ -415,7 +578,7 @@ jobs:
                           setTextColor(red)
                           textSize = 13f
                           gravity = Gravity.CENTER_VERTICAL
-                          typeface = android.graphics.Typeface.DEFAULT_BOLD
+                          typeface = Typeface.DEFAULT_BOLD
                       }.also { it.layoutParams = LinearLayout.LayoutParams(0, MATCH, 4f) })
                       add(key("Clear", 1.3f, textSize = 13f) { store.clear(); render() })
                   }, LinearLayout.LayoutParams(MATCH, dp(44)))
@@ -424,30 +587,47 @@ jobs:
                   val items = store.all()
                   if (items.isEmpty()) {
                       list.addView(TextView(this).apply {
-                          text = "Nothing copied yet.\nCopy some text and it shows up here."
+                          text = "Nothing copied yet.\nCopy text or an image and it shows up here."
                           setTextColor(Color.LTGRAY)
                           gravity = Gravity.CENTER
                           setPadding(dp(8), dp(24), dp(8), dp(8))
                       })
                   }
                   items.forEach { clip ->
-                      val tv = TextView(this).apply {
-                          text = clip
-                          maxLines = 2
-                          ellipsize = TextUtils.TruncateAt.END
-                          setTextColor(Color.WHITE)
-                          textSize = 14f
-                          setPadding(dp(12), dp(8), dp(12), dp(8))
-                          background = keyDrawable(false, false)
-                          setOnClickListener {
-                              it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                              pop(it)
-                              currentInputConnection?.commitText(clip, 1)
+                      if (clip.startsWith("IMG:")) {
+                          val f = File(ImageShare.dir(this), clip.removePrefix("IMG:"))
+                          val iv = ImageView(this).apply {
+                              scaleType = ImageView.ScaleType.CENTER_INSIDE
+                              background = keyDrawable(false, false)
+                              setPadding(dp(4), dp(4), dp(4), dp(4))
+                              setOnClickListener { pop(it); sendLocalImage(f) }
+                              setOnLongClickListener { store.remove(clip); render(); true }
                           }
-                          setOnLongClickListener { store.remove(clip); render(); true }
+                          io.execute {
+                              val bm = decodeThumb(Uri.fromFile(f), 400)
+                              if (bm != null) handler.post { iv.setImageBitmap(bm) }
+                          }
+                          list.addView(iv, LinearLayout.LayoutParams(MATCH, dp(96))
+                              .apply { setMargins(dp(2), dp(2), dp(2), dp(2)) })
+                      } else {
+                          val tv = TextView(this).apply {
+                              text = clip
+                              maxLines = 2
+                              ellipsize = TextUtils.TruncateAt.END
+                              setTextColor(Color.WHITE)
+                              textSize = 14f
+                              setPadding(dp(12), dp(8), dp(12), dp(8))
+                              background = keyDrawable(false, false)
+                              setOnClickListener {
+                                  it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                                  pop(it)
+                                  currentInputConnection?.commitText(clip, 1)
+                              }
+                              setOnLongClickListener { store.remove(clip); render(); true }
+                          }
+                          list.addView(tv, LinearLayout.LayoutParams(MATCH, ViewGroup.LayoutParams.WRAP_CONTENT)
+                              .apply { setMargins(dp(2), dp(2), dp(2), dp(2)) })
                       }
-                      list.addView(tv, LinearLayout.LayoutParams(MATCH, ViewGroup.LayoutParams.WRAP_CONTENT)
-                          .apply { setMargins(dp(2), dp(2), dp(2), dp(2)) })
                   }
                   b.addView(ScrollView(this).apply { addView(list) }, LinearLayout.LayoutParams(MATCH, 0, 1f))
 
@@ -478,38 +658,55 @@ jobs:
 
               private fun charKey(c: Char): View {
                   val label = if (c.isLetter() && (shift || caps)) c.uppercaseChar().toString() else c.toString()
-                  return key(label) { type(c.toString()) }
+                  return key(label, alts = ALTS[c]) { type(c.toString()) }
               }
 
               private fun deleteKey(weight: Float = 1.5f) =
                   key("⌫", weight, repeat = true) { deleteBackward() }
 
-              private fun keyDrawable(accent: Boolean, pressed: Boolean, widthDp: Int = 1) = GradientDrawable().apply {
+              /** Plain rounded drawable for cards and popups. */
+              private fun keyDrawable(accent: Boolean, pressed: Boolean) = GradientDrawable().apply {
                   cornerRadius = dp(9).toFloat()
-                  setColor(
-                      when {
-                          pressed -> red
-                          accent -> Color.argb(110, Color.red(red), Color.green(red), Color.blue(red))
-                          else -> keyFill
-                      }
-                  )
-                  setStroke(dp(widthDp), if (accent) red else Color.argb(130, Color.red(red), Color.green(red), Color.blue(red)))
+                  setColor(if (pressed) red else if (accent) ColorUtils.setAlphaComponent(red, 110) else keyFill)
+                  setStroke(dp(1), ColorUtils.setAlphaComponent(red, 150))
               }
 
-              /** Animated RGB outline: a colour wave that flows across the keys. */
+              private fun pressColor() = if (palette == 1) blue else red
+
+              private fun keyBg(accent: Boolean, pressed: Boolean, big: Boolean): GlowDrawable {
+                  val g = GlowDrawable(dp(9).toFloat(), resources.displayMetrics.density)
+                  g.fill = when {
+                      pressed -> pressColor()
+                      accent -> ColorUtils.setAlphaComponent(if (palette == 1) blue else red, 120)
+                      else -> keyFill
+                  }
+                  g.edge = if (pressed) Color.WHITE else glowColor(0)
+                  g.strength = if (big) 1.7f else 1f
+                  return g
+              }
+
+              /** Animated RGB glow colour: a wave that flows across the keys. */
               private fun glowColor(i: Int): Int {
                   val t = glowPhase + i * 0.03f
-                  if (rainbow) return Color.HSVToColor(235, floatArrayOf((t * 360f) % 360f, 0.9f, 1f))
-                  val hsv = FloatArray(3)
-                  Color.colorToHSV(red, hsv)
                   val wave = (sin(t * 2 * PI) * 0.5 + 0.5).toFloat()
-                  hsv[1] = (0.45f + 0.55f * wave).coerceIn(0f, 1f)
-                  hsv[2] = 0.6f + 0.4f * wave
-                  return Color.HSVToColor(235, hsv)
+                  return when (palette) {
+                      2 -> Color.HSVToColor(255, floatArrayOf((t * 360f) % 360f, 0.9f, 1f))
+                      1 -> ColorUtils.blendARGB(red, blue, wave)
+                      else -> {
+                          val hsv = FloatArray(3)
+                          Color.colorToHSV(red, hsv)
+                          hsv[1] = (0.45f + 0.55f * wave).coerceIn(0f, 1f)
+                          hsv[2] = 0.65f + 0.35f * wave
+                          Color.HSVToColor(255, hsv)
+                      }
+                  }
               }
 
               private fun updateGlow() {
-                  for (g in glowKeys) g.d.setStroke(dp(g.widthDp), glowColor(g.idx))
+                  for (g in glowKeys) {
+                      g.d.edge = glowColor(g.idx)
+                      g.d.invalidateSelf()
+                  }
               }
 
               private fun key(
@@ -519,6 +716,7 @@ jobs:
                   repeat: Boolean = false,
                   textSize: Float = 18f,
                   glow: Boolean = false,
+                  alts: String? = null,
                   onTap: () -> Unit
               ): TextView {
                   val tv = TextView(this)
@@ -526,10 +724,14 @@ jobs:
                   tv.gravity = Gravity.CENTER
                   tv.setTextColor(Color.WHITE)
                   tv.textSize = textSize
-                  tv.typeface = android.graphics.Typeface.DEFAULT_BOLD
-                  val widthDp = if (glow) 2 else 1
-                  val base = keyDrawable(accent || glow, false, widthDp)
-                  glowKeys.add(GlowKey(base, glowIdx++, widthDp))
+                  tv.typeface = Typeface.DEFAULT_BOLD
+                  tv.setShadowLayer(dp(5).toFloat(), 0f, 0f,
+                      ColorUtils.setAlphaComponent(if (palette == 1) blue else red, 220))
+
+                  val base = keyBg(accent || glow, false, glow)
+                  val idx = glowIdx++
+                  base.edge = glowColor(idx)
+                  glowKeys.add(GlowKey(base, idx))
                   tv.background = base
                   tv.layoutParams = LinearLayout.LayoutParams(0, MATCH, weight)
                       .apply { setMargins(dp(2), dp(2), dp(2), dp(2)) }
@@ -537,22 +739,44 @@ jobs:
                   val repeater = object : Runnable {
                       override fun run() { onTap(); handler.postDelayed(this, 45) }
                   }
+                  var longFired = false
+                  val longPress = Runnable {
+                      longFired = true
+                      if (alts != null) showAlts(tv, alts)
+                  }
+                  fun release(v: View) {
+                      v.background = base
+                      if (animationsOn()) {
+                          v.animate().scaleX(1f).scaleY(1f).setDuration(140)
+                              .setInterpolator(OvershootInterpolator(3f)).start()
+                      }
+                  }
+
                   tv.setOnTouchListener { v, e ->
                       when (e.actionMasked) {
                           MotionEvent.ACTION_DOWN -> {
-                              v.background = keyDrawable(accent, true, widthDp)
+                              longFired = false
+                              v.background = keyBg(accent || glow, true, glow)
                               if (animationsOn()) v.animate().scaleX(0.9f).scaleY(0.9f).setDuration(60).start()
                               v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                              onTap()
-                              if (repeat) handler.postDelayed(repeater, 380)
-                          }
-                          MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                              handler.removeCallbacks(repeater)
-                              v.background = base
-                              if (animationsOn()) {
-                                  v.animate().scaleX(1f).scaleY(1f).setDuration(140)
-                                      .setInterpolator(OvershootInterpolator(3f)).start()
+                              if (prefs.getBoolean("sound", false)) audio.playSoundEffect(AudioManager.FX_KEYPRESS_STANDARD)
+                              if (alts != null) {
+                                  handler.postDelayed(longPress, 380)
+                              } else {
+                                  onTap()
+                                  if (repeat) handler.postDelayed(repeater, 380)
                               }
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              handler.removeCallbacks(longPress)
+                              handler.removeCallbacks(repeater)
+                              if (alts != null && !longFired) onTap()
+                              release(v)
+                          }
+                          MotionEvent.ACTION_CANCEL -> {
+                              handler.removeCallbacks(longPress)
+                              handler.removeCallbacks(repeater)
+                              release(v)
                           }
                       }
                       true
@@ -568,6 +792,44 @@ jobs:
                   }.start()
               }
 
+              // ---------------------------------------------------------------- long-press alternates
+
+              private fun showAlts(anchor: View, alts: String) {
+                  dismissAlt()
+                  val rowView = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      background = GradientDrawable().apply {
+                          cornerRadius = dp(10).toFloat()
+                          setColor(Color.parseColor("#14141C"))
+                          setStroke(dp(2), red)
+                      }
+                      setPadding(dp(4), dp(4), dp(4), dp(4))
+                  }
+                  alts.forEach { ch ->
+                      rowView.addView(TextView(this).apply {
+                          text = ch.toString()
+                          textSize = 22f
+                          setTextColor(Color.WHITE)
+                          gravity = Gravity.CENTER
+                          setOnClickListener { type(ch.toString()); dismissAlt() }
+                      }, LinearLayout.LayoutParams(dp(40), dp(44)))
+                  }
+                  val pw = PopupWindow(rowView, ViewGroup.LayoutParams.WRAP_CONTENT, dp(54))
+                  pw.isOutsideTouchable = true
+                  pw.isFocusable = false
+                  altPopup = pw
+                  try {
+                      pw.showAsDropDown(anchor, 0, -(anchor.height + dp(54)))
+                  } catch (e: Exception) {
+                      altPopup = null
+                  }
+              }
+
+              private fun dismissAlt() {
+                  altPopup?.dismiss()
+                  altPopup = null
+              }
+
               // ---------------------------------------------------------------- input actions
 
               private fun type(s: String) {
@@ -580,6 +842,10 @@ jobs:
                   val ic = currentInputConnection ?: return
                   if (!ic.getSelectedText(0).isNullOrEmpty()) ic.commitText("", 1)
                   else sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+              }
+
+              private fun menuAction(id: Int) {
+                  currentInputConnection?.performContextMenuAction(id)
               }
 
               private fun onShift() {
@@ -603,12 +869,108 @@ jobs:
                   else currentInputConnection?.performEditorAction(action)
               }
 
+              private fun setOneHand(v: Int) {
+                  oneHand = v
+                  prefs.edit().putInt("onehand", v).apply()
+                  mode = Mode.KEYS
+                  render()
+              }
+
+              private fun openSettings() {
+                  startActivity(Intent(this, SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+
+              // ---------------------------------------------------------------- images
+
+              private fun hasMediaPermission(): Boolean {
+                  val perm = if (Build.VERSION.SDK_INT >= 33) android.Manifest.permission.READ_MEDIA_IMAGES
+                  else android.Manifest.permission.READ_EXTERNAL_STORAGE
+                  return checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
+              }
+
+              private fun recentImages(all: Boolean, limit: Int): List<Uri> {
+                  val out = mutableListOf<Uri>()
+                  val media = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                  val sel = if (all) null else
+                      "${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} LIKE ? OR ${MediaStore.Images.Media.DISPLAY_NAME} LIKE ?"
+                  val args = if (all) null else arrayOf("%creenshot%", "%creenshot%")
+                  try {
+                      contentResolver.query(
+                          media, arrayOf(MediaStore.Images.Media._ID), sel, args,
+                          "${MediaStore.Images.Media.DATE_ADDED} DESC"
+                      )?.use { c ->
+                          val idCol = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+                          while (c.moveToNext() && out.size < limit) {
+                              out.add(ContentUris.withAppendedId(media, c.getLong(idCol)))
+                          }
+                      }
+                  } catch (e: Exception) {
+                  }
+                  return out
+              }
+
+              private fun decodeThumb(uri: Uri, max: Int): Bitmap? = try {
+                  val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, o) }
+                  var s = 1
+                  while (o.outWidth / (s * 2) >= max && o.outHeight / (s * 2) >= max) s *= 2
+                  contentResolver.openInputStream(uri)?.use {
+                      BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = s })
+                  }
+              } catch (e: Exception) {
+                  null
+              }
+
+              /** Sends an image from the gallery/screenshots to the focused app. */
+              private fun sendImage(src: Uri) {
+                  io.execute {
+                      val mime = contentResolver.getType(src) ?: "image/png"
+                      var ext = mime.substringAfter('/').replace("jpeg", "jpg")
+                      if (ext !in listOf("png", "jpg", "gif", "webp")) ext = "png"
+                      val shared = ImageShare.copyToShared(this, src, "send_${System.currentTimeMillis()}.$ext")
+                      handler.post {
+                          if (shared == null) toast("Couldn't read that image") else deliver(shared, mime)
+                      }
+                  }
+              }
+
+              private fun sendLocalImage(f: File) {
+                  if (!f.exists()) { toast("That image is no longer available"); return }
+                  val uri = FileProvider.getUriForFile(this, ImageShare.AUTH, f)
+                  val ext = f.extension.lowercase()
+                  deliver(uri, "image/" + if (ext == "jpg") "jpeg" else ext)
+              }
+
+              private fun deliver(uri: Uri, mime: String) {
+                  if (ImageShare.send(this, uri, mime)) return
+                  // The app doesn't take images from keyboards: copy it so the user can paste manually.
+                  ignoreClipUntil = SystemClock.uptimeMillis() + 1500
+                  clipboard.setPrimaryClip(ClipData.newUri(contentResolver, "Image", uri))
+                  toast("This app can't take images from the keyboard. Image copied: long-press the text box and tap Paste.")
+              }
+
               // ---------------------------------------------------------------- suggestions
 
               private fun updateSuggestions() {
                   val row = suggestionRow ?: return
                   row.removeAllViews()
                   if (mode != Mode.KEYS) return
+
+                  row.addView(TextView(this).apply {
+                      text = "⋯"
+                      textSize = 24f
+                      setTextColor(if (palette == 1) blue else red)
+                      typeface = Typeface.DEFAULT_BOLD
+                      gravity = Gravity.CENTER
+                      setOnClickListener {
+                          it.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                          mode = Mode.TOOLS
+                          render()
+                      }
+                  }, LinearLayout.LayoutParams(dp(52), MATCH))
+
                   val before = currentInputConnection?.getTextBeforeCursor(30, 0)?.toString().orEmpty()
                   val word = before.takeLastWhile { it.isLetter() }
                   val pool = if (filipino) FIL_WORDS + EN_WORDS else EN_WORDS + FIL_WORDS
@@ -620,6 +982,8 @@ jobs:
                   val capitalize = word.firstOrNull()?.isUpperCase() == true
                   list.forEachIndexed { i, s ->
                       val shown = if (capitalize) s.replaceFirstChar { it.uppercase() } else s
+                      row.addView(View(this).apply { setBackgroundColor(Color.argb(90, 255, 23, 68)) },
+                          LinearLayout.LayoutParams(dp(1), dp(18)))
                       row.addView(TextView(this).apply {
                           text = shown
                           setTextColor(Color.WHITE)
@@ -631,10 +995,6 @@ jobs:
                               ic.commitText("$shown ", 1)
                           }
                       }, LinearLayout.LayoutParams(0, MATCH, 1f))
-                      if (i < list.size - 1) {
-                          row.addView(View(this).apply { setBackgroundColor(Color.argb(90, 255, 23, 68)) },
-                              LinearLayout.LayoutParams(dp(1), dp(18)))
-                      }
                   }
               }
 
@@ -687,6 +1047,101 @@ jobs:
           }
           KBEOF
           mkdir -p app/src/main/java/com/example/customkeyboard
+          cat > app/src/main/java/com/example/customkeyboard/GlowDrawable.kt <<'KBEOF'
+          package com.example.customkeyboard
+
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.ColorFilter
+          import android.graphics.Paint
+          import android.graphics.PixelFormat
+          import android.graphics.RectF
+          import android.graphics.drawable.Drawable
+
+          /** A key background with a layered neon glow around its edge. */
+          class GlowDrawable(private val radius: Float, private val density: Float) : Drawable() {
+              var fill = Color.parseColor("#CC14141C")
+              var edge = Color.RED
+              var strength = 1f
+
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val r = RectF()
+              private val widths = floatArrayOf(8f, 5f, 3f, 1.5f)
+              private val alphas = intArrayOf(38, 70, 120, 255)
+
+              override fun draw(c: Canvas) {
+                  p.style = Paint.Style.FILL
+                  p.color = fill
+                  r.set(bounds)
+                  c.drawRoundRect(r, radius, radius, p)
+                  p.color = Color.argb(26, Color.red(edge), Color.green(edge), Color.blue(edge))
+                  c.drawRoundRect(r, radius, radius, p)
+                  p.style = Paint.Style.STROKE
+                  for (i in widths.indices) {
+                      val w = widths[i] * density
+                      p.strokeWidth = w
+                      val a = (alphas[i] * strength).toInt().coerceIn(0, 255)
+                      p.color = Color.argb(a, Color.red(edge), Color.green(edge), Color.blue(edge))
+                      r.set(bounds)
+                      r.inset(w / 2f, w / 2f)
+                      c.drawRoundRect(r, radius, radius, p)
+                  }
+              }
+
+              override fun setAlpha(alpha: Int) {}
+              override fun setColorFilter(colorFilter: ColorFilter?) {}
+              @Deprecated("Deprecated in Java")
+              override fun getOpacity() = PixelFormat.TRANSLUCENT
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/example/customkeyboard
+          cat > app/src/main/java/com/example/customkeyboard/ImageShare.kt <<'KBEOF'
+          package com.example.customkeyboard
+
+          import android.content.ClipDescription
+          import android.content.Context
+          import android.content.Intent
+          import android.inputmethodservice.InputMethodService
+          import android.net.Uri
+          import android.os.Build
+          import androidx.core.content.FileProvider
+          import androidx.core.view.inputmethod.EditorInfoCompat
+          import androidx.core.view.inputmethod.InputConnectionCompat
+          import androidx.core.view.inputmethod.InputContentInfoCompat
+          import java.io.File
+
+          /** Copies images into our own FileProvider and sends them to the focused app. */
+          object ImageShare {
+              const val AUTH = "com.example.customkeyboard.files"
+
+              fun dir(ctx: Context) = File(ctx.cacheDir, "shared").apply { mkdirs() }
+
+              /** Copies [src] into the shared folder and returns a FileProvider Uri for it. */
+              fun copyToShared(ctx: Context, src: Uri, name: String): Uri? {
+                  return try {
+                      val f = File(dir(ctx), name)
+                      val input = ctx.contentResolver.openInputStream(src) ?: return null
+                      input.use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+                      FileProvider.getUriForFile(ctx, AUTH, f)
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              /** Returns true if the focused app accepted the image directly. */
+              fun send(service: InputMethodService, uri: Uri, mime: String): Boolean {
+                  val ic = service.currentInputConnection ?: return false
+                  val ei = service.currentInputEditorInfo ?: return false
+                  val supported = EditorInfoCompat.getContentMimeTypes(ei)
+                  if (supported.none { ClipDescription.compareMimeTypes(mime, it) }) return false
+                  service.grantUriPermission(ei.packageName, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  val info = InputContentInfoCompat(uri, ClipDescription("image", arrayOf(mime)), null)
+                  val flags = if (Build.VERSION.SDK_INT >= 25) InputConnectionCompat.INPUT_CONTENT_GRANT_READ_URI_PERMISSION else 0
+                  return InputConnectionCompat.commitContent(ic, ei, info, flags, null)
+              }
+          }
+          KBEOF
+          mkdir -p app/src/main/java/com/example/customkeyboard
           cat > app/src/main/java/com/example/customkeyboard/RgbBarView.kt <<'KBEOF'
           package com.example.customkeyboard
 
@@ -705,7 +1160,7 @@ jobs:
               private var wantAnim = true
 
               private val animator = ValueAnimator.ofFloat(0f, 1f).apply {
-                  duration = 2600
+                  duration = 2200
                   repeatCount = ValueAnimator.INFINITE
                   interpolator = LinearInterpolator()
                   addUpdateListener { phase = it.animatedValue as Float; invalidate() }
@@ -723,17 +1178,22 @@ jobs:
                   Color.parseColor("#FF1744")
               )
 
-              /** Red-family flow for the chosen accent, or a full RGB rainbow. */
-              fun setPalette(accent: Int, rainbow: Boolean) {
-                  colors = if (rainbow) {
-                      intArrayOf(Color.RED, Color.YELLOW, Color.GREEN, Color.CYAN, Color.BLUE, Color.MAGENTA, Color.RED)
-                  } else {
-                      val hsv = FloatArray(3)
-                      Color.colorToHSV(accent, hsv)
-                      fun variant(dh: Float, ds: Float, dv: Float) = Color.HSVToColor(
-                          floatArrayOf((hsv[0] + dh + 360f) % 360f, (hsv[1] * ds).coerceIn(0f, 1f), (hsv[2] * dv).coerceIn(0f, 1f))
-                      )
-                      intArrayOf(accent, variant(0f, 0.65f, 1f), variant(0f, 1f, 0.7f), variant(14f, 1f, 1f), accent)
+              /** mode 0 = accent shades, 1 = accent <-> blue, 2 = full RGB rainbow. */
+              fun setPalette(accent: Int, mode: Int) {
+                  colors = when (mode) {
+                      2 -> intArrayOf(Color.RED, Color.YELLOW, Color.GREEN, Color.CYAN, Color.BLUE, Color.MAGENTA, Color.RED)
+                      1 -> {
+                          val blue = Color.parseColor("#2979FF")
+                          intArrayOf(accent, blue, accent, blue, accent)
+                      }
+                      else -> {
+                          val hsv = FloatArray(3)
+                          Color.colorToHSV(accent, hsv)
+                          fun variant(dh: Float, ds: Float, dv: Float) = Color.HSVToColor(
+                              floatArrayOf((hsv[0] + dh + 360f) % 360f, (hsv[1] * ds).coerceIn(0f, 1f), (hsv[2] * dv).coerceIn(0f, 1f))
+                          )
+                          intArrayOf(accent, variant(0f, 0.65f, 1f), variant(0f, 1f, 0.7f), variant(14f, 1f, 1f), accent)
+                      }
                   }
                   rebuild()
               }
@@ -768,6 +1228,7 @@ jobs:
           cat > app/src/main/java/com/example/customkeyboard/SettingsActivity.kt <<'KBEOF'
           package com.example.customkeyboard
 
+          import android.Manifest
           import android.content.Context
           import android.content.Intent
           import android.graphics.Bitmap
@@ -775,6 +1236,7 @@ jobs:
           import android.graphics.Color
           import android.graphics.drawable.GradientDrawable
           import android.net.Uri
+          import android.os.Build
           import android.os.Bundle
           import android.provider.Settings
           import android.view.Gravity
@@ -796,10 +1258,16 @@ jobs:
           class SettingsActivity : ComponentActivity() {
 
               private val red = Color.parseColor("#FF1744")
+              private val blue = Color.parseColor("#2979FF")
 
               private val picker =
                   registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
                       if (uri != null) saveBackground(uri)
+                  }
+
+              private val permission =
+                  registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+                      toast(if (ok) "Screenshot access allowed" else "Access not allowed")
                   }
 
               override fun onCreate(savedInstanceState: Bundle?) {
@@ -817,6 +1285,7 @@ jobs:
                       textSize = 26f
                       typeface = android.graphics.Typeface.DEFAULT_BOLD
                       letterSpacing = 0.12f
+                      setShadowLayer(dp(8).toFloat(), 0f, 0f, blue)
                   })
                   col.addView(label("RGB gaming keyboard · English + Filipino"))
 
@@ -828,8 +1297,22 @@ jobs:
                       (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
                           .showInputMethodPicker()
                   })
+                  col.addView(button("Allow screenshot & photo access") {
+                      permission.launch(
+                          if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_IMAGES
+                          else Manifest.permission.READ_EXTERNAL_STORAGE
+                      )
+                  })
+                  col.addView(label("Photo access lets the 🖼 Images panel send your screenshots. Choose \"Allow all\"."))
 
                   col.addView(section("2 · Look"))
+                  col.addView(label("Glow colors"))
+                  col.addView(LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      addView(chip("Red & Blue") { prefs.edit().putInt("palette", 1).apply(); toast("Red & Blue") })
+                      addView(chip("Red") { prefs.edit().putInt("palette", 0).apply(); toast("Red") })
+                      addView(chip("Rainbow") { prefs.edit().putInt("palette", 2).apply(); toast("Rainbow") })
+                  })
                   col.addView(button("Choose background image") {
                       picker.launch(arrayOf("image/*"))
                   })
@@ -842,7 +1325,7 @@ jobs:
                       max = 230
                       progress = prefs.getInt("dim", 160)
                       progressTintList = android.content.res.ColorStateList.valueOf(red)
-                      thumbTintList = android.content.res.ColorStateList.valueOf(red)
+                      thumbTintList = android.content.res.ColorStateList.valueOf(blue)
                       setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                           override fun onProgressChanged(s: SeekBar?, v: Int, fromUser: Boolean) {
                               prefs.edit().putInt("dim", v).apply()
@@ -851,31 +1334,14 @@ jobs:
                           override fun onStopTrackingTouch(s: SeekBar?) {}
                       })
                   })
-                  col.addView(toggle("RGB light bar", prefs.getBoolean("rgb", true)) {
+                  col.addView(toggle("RGB glow", prefs.getBoolean("rgb", true)) {
                       prefs.edit().putBoolean("rgb", it).apply()
                   })
                   col.addView(toggle("Animations", prefs.getBoolean("anim", true)) {
                       prefs.edit().putBoolean("anim", it).apply()
                   })
-
-                  col.addView(label("Accent color"))
-                  col.addView(LinearLayout(this).apply {
-                      orientation = LinearLayout.HORIZONTAL
-                      listOf("#FF1744", "#FF3D00", "#FF4081", "#D50000").forEach { hex ->
-                          addView(View(this@SettingsActivity).apply {
-                              background = GradientDrawable().apply {
-                                  shape = GradientDrawable.OVAL
-                                  setColor(Color.parseColor(hex))
-                              }
-                              setOnClickListener {
-                                  prefs.edit().putInt("accent", Color.parseColor(hex)).apply()
-                                  toast("Accent updated")
-                              }
-                          }, LinearLayout.LayoutParams(dp(46), dp(46)).apply { rightMargin = dp(14) })
-                      }
-                  })
-                  col.addView(toggle("Full RGB rainbow mode", prefs.getBoolean("rainbow", false)) {
-                      prefs.edit().putBoolean("rainbow", it).apply()
+                  col.addView(toggle("Key click sound", prefs.getBoolean("sound", false)) {
+                      prefs.edit().putBoolean("sound", it).apply()
                   })
 
                   col.addView(section("3 · Try it"))
@@ -884,6 +1350,7 @@ jobs:
                       setHintTextColor(Color.GRAY)
                       setTextColor(Color.WHITE)
                   })
+                  col.addView(label("Tips: tap ⋯ on the suggestion bar for tools (images, clipboard, cut/copy/paste, cursor keys, one-handed mode). Hold a letter for accents, e.g. n → ñ."))
 
                   setContentView(ScrollView(this).apply {
                       setBackgroundColor(Color.parseColor("#0B0B10"))
@@ -924,17 +1391,28 @@ jobs:
                   setPadding(0, dp(24), 0, dp(6))
               }
 
+              private fun outline(edge: Int) = GradientDrawable().apply {
+                  cornerRadius = dp(10).toFloat()
+                  setColor(Color.parseColor("#1A1A22"))
+                  setStroke(dp(2), edge)
+              }
+
               private fun button(t: String, onClick: () -> Unit) = Button(this).apply {
                   text = t
                   setTextColor(Color.WHITE)
                   isAllCaps = false
-                  background = GradientDrawable().apply {
-                      cornerRadius = dp(10).toFloat()
-                      setColor(Color.parseColor("#1A1A22"))
-                      setStroke(dp(1), red)
-                  }
+                  background = outline(red)
                   layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50))
                       .apply { topMargin = dp(8) }
+                  setOnClickListener { onClick() }
+              }
+
+              private fun chip(t: String, onClick: () -> Unit) = Button(this).apply {
+                  text = t
+                  setTextColor(Color.WHITE)
+                  isAllCaps = false
+                  background = outline(blue)
+                  layoutParams = LinearLayout.LayoutParams(0, dp(46), 1f).apply { rightMargin = dp(8) }
                   setOnClickListener { onClick() }
               }
 
@@ -965,6 +1443,13 @@ jobs:
           <resources>
               <string name="app_name">Custom Keyboard</string>
           </resources>
+          KBEOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/file_paths.xml <<'KBEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <cache-path name="shared" path="shared/" />
+          </paths>
           KBEOF
           mkdir -p app/src/main/res/xml
           cat > app/src/main/res/xml/method.xml <<'KBEOF'
