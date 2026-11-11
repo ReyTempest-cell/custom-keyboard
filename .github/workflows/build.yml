@@ -222,9 +222,8 @@ jobs:
               override fun onEvaluateFullscreenMode() = false
 
               override fun onCreateInputView(): View {
-                  val frame = FrameLayout(this).apply {
+                  val frame = FixedHeightFrame(this, dp(KB_HEIGHT)).apply {
                       setBackgroundColor(Color.parseColor("#0B0B10"))
-                      layoutParams = ViewGroup.LayoutParams(MATCH, dp(KB_HEIGHT))
                   }
                   root = frame
                   bgView = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
@@ -677,6 +676,13 @@ jobs:
                       "kuwarta pagkain tubig kape gatas ulam kanin almusal tanghalian hapunan meryenda " +
                       "pinoy pilipino pilipinas maynila cebu davao laban panalo talo kalaban koponan " +
                       "manlalaro sigaw tawa iyak ngiti halik yakap").split(" ")
+              }
+          }
+
+          /** Forces the keyboard to a fixed height so the keys don't stretch to fill the screen. */
+          private class FixedHeightFrame(ctx: Context, private val fixedHeight: Int) : FrameLayout(ctx) {
+              override fun onMeasure(widthSpec: Int, heightSpec: Int) {
+                  super.onMeasure(widthSpec, View.MeasureSpec.makeMeasureSpec(fixedHeight, View.MeasureSpec.EXACTLY))
               }
           }
           KBEOF
