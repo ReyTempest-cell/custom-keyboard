@@ -202,8 +202,18 @@ jobs:
 
               private var red = Color.parseColor("#FF1744")
               private val blue = Color.parseColor("#5CC8FF")
-              private var palette = 1 // 0 = red, 1 = red & blue, 2 = rainbow
-              private val keyFill = Color.parseColor("#CC14141C")
+              private var palette = 1 // 0 = red, 1 = red & blue, 2 = rainbow, 3 = slime blue theme
+              private val gold = Color.parseColor("#FFC93C")
+
+              private fun fillColor() =
+                  if (palette == 3) Color.parseColor("#CC102338") else Color.parseColor("#CC14141C")
+
+              /** Main glow/text colour of the current theme. */
+              private fun uiColor() = when (palette) {
+                  1 -> blue
+                  3 -> Color.parseColor("#7FD4FF")
+                  else -> red
+              }
               private val handler = Handler(Looper.getMainLooper())
               private val io = Executors.newSingleThreadExecutor()
 
@@ -376,6 +386,7 @@ jobs:
                   palette = prefs.getInt("palette", 1)
                   oneHand = prefs.getInt("onehand", 0)
                   rgbBar?.setPalette(red, palette)
+                  root?.setBackgroundColor(Color.parseColor(if (palette == 3) "#07111F" else "#0B0B10"))
                   if (prefs.getBoolean("rgb", true) && animationsOn()) {
                       if (!glowAnimator.isRunning) glowAnimator.start()
                   } else {
@@ -695,18 +706,18 @@ jobs:
               /** Plain rounded drawable for cards and popups. */
               private fun keyDrawable(accent: Boolean, pressed: Boolean) = GradientDrawable().apply {
                   cornerRadius = dp(9).toFloat()
-                  setColor(if (pressed) red else if (accent) ColorUtils.setAlphaComponent(red, 110) else keyFill)
+                  setColor(if (pressed) uiColor() else if (accent) ColorUtils.setAlphaComponent(uiColor(), 110) else fillColor())
                   setStroke(dp(1), ColorUtils.setAlphaComponent(red, 150))
               }
 
-              private fun pressColor() = if (palette == 1) blue else red
+              private fun pressColor() = uiColor()
 
               private fun keyBg(accent: Boolean, pressed: Boolean, big: Boolean): GlowDrawable {
                   val g = GlowDrawable(dp(9).toFloat(), resources.displayMetrics.density * if (isLandscape()) 0.7f else 1f)
                   g.fill = when {
                       pressed -> pressColor()
-                      accent -> ColorUtils.setAlphaComponent(if (palette == 1) blue else red, 120)
-                      else -> keyFill
+                      accent -> ColorUtils.setAlphaComponent(if (palette == 3) gold else uiColor(), 130)
+                      else -> fillColor()
                   }
                   g.edge = if (pressed) Color.WHITE else glowColor(0)
                   g.strength = if (big) 1.7f else 1f
@@ -720,6 +731,7 @@ jobs:
                   return when (palette) {
                       2 -> Color.HSVToColor(255, floatArrayOf((t * 360f) % 360f, 0.9f, 1f))
                       1 -> ColorUtils.blendARGB(red, blue, wave)
+                      3 -> ColorUtils.blendARGB(Color.parseColor("#6EC6FF"), Color.parseColor("#DDF6FF"), wave)
                       else -> {
                           val hsv = FloatArray(3)
                           Color.colorToHSV(red, hsv)
@@ -754,7 +766,7 @@ jobs:
                   tv.textSize = textSize
                   tv.typeface = Typeface.DEFAULT_BOLD
                   tv.setShadowLayer(dp(5).toFloat(), 0f, 0f,
-                      ColorUtils.setAlphaComponent(if (palette == 1) blue else red, 220))
+                      ColorUtils.setAlphaComponent(uiColor(), 220))
 
                   val base = keyBg(accent || glow, false, glow)
                   val idx = glowIdx++
@@ -785,7 +797,10 @@ jobs:
                           MotionEvent.ACTION_DOWN -> {
                               longFired = false
                               v.background = keyBg(accent || glow, true, glow)
-                              if (animationsOn()) v.animate().scaleX(0.9f).scaleY(0.9f).setDuration(60).start()
+                              if (animationsOn()) {
+                                  if (palette == 3) v.animate().scaleX(1.07f).scaleY(0.84f).setDuration(70).start()
+                                  else v.animate().scaleX(0.9f).scaleY(0.9f).setDuration(60).start()
+                              }
                               v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                               if (prefs.getBoolean("sound", false)) audio.playSoundEffect(AudioManager.FX_KEYPRESS_STANDARD)
                               if (alts != null) {
@@ -1025,7 +1040,7 @@ jobs:
                   row.addView(TextView(this).apply {
                       text = "⋯"
                       textSize = 24f
-                      setTextColor(if (palette == 1) blue else red)
+                      setTextColor(uiColor())
                       typeface = Typeface.DEFAULT_BOLD
                       gravity = Gravity.CENTER
                       setOnClickListener {
@@ -1261,6 +1276,10 @@ jobs:
               /** mode 0 = accent shades, 1 = accent <-> blue, 2 = full RGB rainbow. */
               fun setPalette(accent: Int, mode: Int) {
                   colors = when (mode) {
+                      3 -> intArrayOf(
+                          Color.parseColor("#6EC6FF"), Color.parseColor("#DDF6FF"),
+                          Color.parseColor("#3FA7E8"), Color.parseColor("#BFEFFF"), Color.parseColor("#6EC6FF")
+                      )
                       2 -> intArrayOf(Color.RED, Color.YELLOW, Color.GREEN, Color.CYAN, Color.BLUE, Color.MAGENTA, Color.RED)
                       1 -> {
                           val blue = Color.parseColor("#5CC8FF")
@@ -1392,6 +1411,9 @@ jobs:
                       addView(chip("Red & Blue") { prefs.edit().putInt("palette", 1).apply(); toast("Red & Blue") })
                       addView(chip("Red") { prefs.edit().putInt("palette", 0).apply(); toast("Red") })
                       addView(chip("Rainbow") { prefs.edit().putInt("palette", 2).apply(); toast("Rainbow") })
+                  })
+                  col.addView(button("Rimuru slime theme (light blue, jelly keys)") {
+                      prefs.edit().putInt("palette", 3).apply(); toast("Slime theme on")
                   })
                   col.addView(button("Choose background image") {
                       picker.launch(arrayOf("image/*"))
