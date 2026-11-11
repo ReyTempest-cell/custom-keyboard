@@ -154,6 +154,7 @@ jobs:
           import android.content.Intent
           import android.content.SharedPreferences
           import android.content.pm.PackageManager
+          import android.content.res.Configuration
           import android.graphics.Bitmap
           import android.graphics.BitmapFactory
           import android.graphics.Color
@@ -167,6 +168,7 @@ jobs:
           import android.os.Looper
           import android.os.SystemClock
           import android.provider.MediaStore
+          import android.text.InputType
           import android.text.TextUtils
           import android.view.Gravity
           import android.view.HapticFeedbackConstants
@@ -199,7 +201,7 @@ jobs:
               private val KB_HEIGHT = 290 // dp
 
               private var red = Color.parseColor("#FF1744")
-              private val blue = Color.parseColor("#2979FF")
+              private val blue = Color.parseColor("#5CC8FF")
               private var palette = 1 // 0 = red, 1 = red & blue, 2 = rainbow
               private val keyFill = Color.parseColor("#CC14141C")
               private val handler = Handler(Looper.getMainLooper())
@@ -220,6 +222,8 @@ jobs:
               private lateinit var store: ClipboardStore
               private lateinit var clipboard: ClipboardManager
               private lateinit var audio: AudioManager
+              private lateinit var model: WordModel
+              private var symPage = 1
 
               private var root: FrameLayout? = null
               private var bgView: ImageView? = null
@@ -243,7 +247,10 @@ jobs:
 
               private val ALTS = mapOf(
                   'a' to "àáâäãåā", 'e' to "èéêëēė", 'i' to "ìíîïī", 'o' to "òóôöõō",
-                  'u' to "ùúûüū", 'n' to "ñ", 'c' to "ç", 's' to "ßś", 'y' to "ýÿ", 'z' to "žź"
+                  'u' to "ùúûüū", 'n' to "ñ", 'c' to "ç", 's' to "ßś", 'y' to "ýÿ", 'z' to "žź",
+                  '(' to "<[{", ')' to ">]}", '-' to "–—", '/' to "\\|", '*' to "×†",
+                  '!' to "¡", '?' to "¿", '"' to "“”«»", '\'' to "‘’", '$' to "¢£€¥",
+                  '&' to "§", '+' to "±", '=' to "≠≈", '%' to "‰°", '0' to "°"
               )
 
               private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
@@ -277,11 +284,14 @@ jobs:
                   prefs = getSharedPreferences("kb", Context.MODE_PRIVATE)
                   store = ClipboardStore(this)
                   audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                  model = WordModel(this, EN_WORDS, FIL_WORDS)
+                  io.execute { model.load() }
                   clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                   clipboard.addPrimaryClipChangedListener(clipListener)
               }
 
               override fun onDestroy() {
+                  model.save()
                   glowAnimator.cancel()
                   io.shutdown()
                   clipboard.removePrimaryClipChangedListener(clipListener)
@@ -291,7 +301,7 @@ jobs:
               override fun onEvaluateFullscreenMode() = false
 
               override fun onCreateInputView(): View {
-                  val frame = FixedHeightFrame(this, dp(KB_HEIGHT)).apply {
+                  val frame = FixedHeightFrame(this) { kbHeight() }.apply {
                       setBackgroundColor(Color.parseColor("#0B0B10"))
                   }
                   root = frame
@@ -334,7 +344,14 @@ jobs:
                   }
               }
 
+              override fun onConfigurationChanged(newConfig: Configuration) {
+                  super.onConfigurationChanged(newConfig)
+                  root?.requestLayout()
+                  render()
+              }
+
               override fun onFinishInputView(finishingInput: Boolean) {
+                  model.save()
                   glowAnimator.cancel()
                   dismissAlt()
                   super.onFinishInputView(finishingInput)
@@ -392,6 +409,8 @@ jobs:
                       dp(3) + if (oneHand == 2) side else 0, 0,
                       dp(3) + if (oneHand == 1) side else 0, dp(4)
                   )
+                  if (!symbols) symPage = 1
+                  suggestionRow?.layoutParams?.height = dp(if (isLandscape()) 30 else 38)
                   suggestionRow?.visibility = if (mode == Mode.KEYS) View.VISIBLE else View.GONE
                   when (mode) {
                       Mode.KEYS -> buildKeys(b)
@@ -407,13 +426,21 @@ jobs:
                   b.addView(row { "1234567890".forEach { add(charKey(it)) } }, rowLp())
 
                   if (symbols) {
-                      b.addView(row { "@#$%&-+()/".forEach { add(charKey(it)) } }, rowLp())
-                      b.addView(row { "*\"':;!?₱€=".forEach { add(charKey(it)) } }, rowLp())
-                      b.addView(row {
-                          add(spacer(1.5f))
-                          "[]{}<>|".forEach { add(charKey(it)) }
-                          add(deleteKey())
-                      }, rowLp())
+                      if (symPage == 1) {
+                          b.addView(row { "@#\$_&-+()/".forEach { add(charKey(it)) } }, rowLp())
+                          b.addView(row {
+                              add(key("=\\<", 1.5f, textSize = 14f) { symPage = 2; render() })
+                              "*\"':;!?".forEach { add(charKey(it)) }
+                              add(deleteKey())
+                          }, rowLp())
+                      } else {
+                          b.addView(row { "~`|•√π÷×¶∆".forEach { add(charKey(it)) } }, rowLp())
+                          b.addView(row {
+                              add(key("?123", 1.5f, textSize = 14f) { symPage = 1; render() })
+                              "£₱€¥%^=".forEach { add(charKey(it)) }
+                              add(deleteKey())
+                          }, rowLp())
+                      }
                   } else {
                       b.addView(row { "qwertyuiop".forEach { add(charKey(it)) } }, rowLp())
                       if (filipino) {
@@ -434,16 +461,17 @@ jobs:
 
                   b.addView(row {
                       add(key(if (symbols) "ABC" else "?123", 1.3f, textSize = 14f) {
-                          symbols = !symbols; render()
+                          symbols = !symbols; symPage = 1; render()
                       })
-                      add(key("😊", 1f) { mode = Mode.EMOJI; render() })
-                      add(key("📋", 1f) { mode = Mode.CLIP; render() })
-                      add(key(if (filipino) "FIL" else "EN", 1.1f, textSize = 13f) {
+                      add(key(",", 0.9f) { type(",") })
+                      add(key("😊", 0.9f) { mode = Mode.EMOJI; render() })
+                      add(key("📋", 0.9f) { mode = Mode.CLIP; render() })
+                      add(key(if (filipino) "FIL" else "EN", 1f, textSize = 13f) {
                           filipino = !filipino; render()
                       })
-                      add(key(if (filipino) "Custom · FIL" else "Custom · EN", 3f, textSize = 12f, glow = true) { type(" ") })
-                      add(key(".", 1f, alts = ",?!'\":;-") { type(".") })
-                      add(key("⏎", 1.4f, accent = true) { onEnter() })
+                      add(key(if (filipino) "Custom · FIL" else "Custom · EN", 2.8f, textSize = 12f, glow = true) { type(" ") })
+                      add(key(".", 0.9f, alts = ",?!'\":;-") { type(".") })
+                      add(key("⏎", 1.3f, accent = true) { onEnter() })
                   }, rowLp())
               }
 
@@ -480,7 +508,7 @@ jobs:
                   b.addView(row {
                       add(key("📸 Screenshots", 2f, accent = !allPhotos, textSize = 12f) { allPhotos = false; render() })
                       add(key("🖼 Recent", 2f, accent = allPhotos, textSize = 12f) { allPhotos = true; render() })
-                  }, LinearLayout.LayoutParams(MATCH, dp(44)))
+                  }, LinearLayout.LayoutParams(MATCH, hdp(44)))
 
                   val bottom = row {
                       add(key("ABC", 1.5f, textSize = 14f) { mode = Mode.KEYS; render() })
@@ -494,7 +522,7 @@ jobs:
                           gravity = Gravity.CENTER
                       }, LinearLayout.LayoutParams(MATCH, 0, 1f))
                       bottom.addView(key("Open settings", 3f, accent = true, textSize = 13f) { openSettings() })
-                      b.addView(bottom, LinearLayout.LayoutParams(MATCH, dp(46)))
+                      b.addView(bottom, LinearLayout.LayoutParams(MATCH, hdp(46)))
                       return
                   }
 
@@ -524,7 +552,7 @@ jobs:
                               } else {
                                   iv.setBackgroundColor(Color.TRANSPARENT)
                               }
-                              r.addView(iv, LinearLayout.LayoutParams(0, dp(78), 1f).apply {
+                              r.addView(iv, LinearLayout.LayoutParams(0, hdp(78), 1f).apply {
                                   setMargins(dp(2), dp(2), dp(2), dp(2))
                               })
                           }
@@ -532,7 +560,7 @@ jobs:
                       }
                       b.addView(ScrollView(this).apply { addView(list) }, LinearLayout.LayoutParams(MATCH, 0, 1f))
                   }
-                  b.addView(bottom, LinearLayout.LayoutParams(MATCH, dp(46)))
+                  b.addView(bottom, LinearLayout.LayoutParams(MATCH, hdp(46)))
               }
 
               private fun buildEmoji(b: LinearLayout) {
@@ -541,7 +569,7 @@ jobs:
                           add(key(cat.first, 1f, accent = i == emojiCat) { emojiCat = i; render() })
                       }
                   }
-                  b.addView(tabs, LinearLayout.LayoutParams(MATCH, dp(44)))
+                  b.addView(tabs, LinearLayout.LayoutParams(MATCH, hdp(44)))
 
                   val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                   EMOJI[emojiCat].second.chunked(8).forEach { chunk ->
@@ -558,7 +586,7 @@ jobs:
                                   currentInputConnection?.commitText(e, 1)
                               }
                           }
-                          r.addView(tv, LinearLayout.LayoutParams(0, dp(46), 1f))
+                          r.addView(tv, LinearLayout.LayoutParams(0, hdp(46), 1f))
                       }
                       list.addView(r)
                   }
@@ -568,7 +596,7 @@ jobs:
                       add(key("ABC", 1.5f, textSize = 14f) { mode = Mode.KEYS; render() })
                       add(spacer(5f))
                       add(deleteKey(1.5f))
-                  }, LinearLayout.LayoutParams(MATCH, dp(46)))
+                  }, LinearLayout.LayoutParams(MATCH, hdp(46)))
               }
 
               private fun buildClip(b: LinearLayout) {
@@ -581,7 +609,7 @@ jobs:
                           typeface = Typeface.DEFAULT_BOLD
                       }.also { it.layoutParams = LinearLayout.LayoutParams(0, MATCH, 4f) })
                       add(key("Clear", 1.3f, textSize = 13f) { store.clear(); render() })
-                  }, LinearLayout.LayoutParams(MATCH, dp(44)))
+                  }, LinearLayout.LayoutParams(MATCH, hdp(44)))
 
                   val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
                   val items = store.all()
@@ -607,7 +635,7 @@ jobs:
                               val bm = decodeThumb(Uri.fromFile(f), 400)
                               if (bm != null) handler.post { iv.setImageBitmap(bm) }
                           }
-                          list.addView(iv, LinearLayout.LayoutParams(MATCH, dp(96))
+                          list.addView(iv, LinearLayout.LayoutParams(MATCH, hdp(96))
                               .apply { setMargins(dp(2), dp(2), dp(2), dp(2)) })
                       } else {
                           val tv = TextView(this).apply {
@@ -640,7 +668,7 @@ jobs:
                           gravity = Gravity.CENTER
                       }.also { it.layoutParams = LinearLayout.LayoutParams(0, MATCH, 5f) })
                       add(deleteKey(1.5f))
-                  }, LinearLayout.LayoutParams(MATCH, dp(46)))
+                  }, LinearLayout.LayoutParams(MATCH, hdp(46)))
               }
 
               // ---------------------------------------------------------------- key factory
@@ -674,7 +702,7 @@ jobs:
               private fun pressColor() = if (palette == 1) blue else red
 
               private fun keyBg(accent: Boolean, pressed: Boolean, big: Boolean): GlowDrawable {
-                  val g = GlowDrawable(dp(9).toFloat(), resources.displayMetrics.density)
+                  val g = GlowDrawable(dp(9).toFloat(), resources.displayMetrics.density * if (isLandscape()) 0.7f else 1f)
                   g.fill = when {
                       pressed -> pressColor()
                       accent -> ColorUtils.setAlphaComponent(if (palette == 1) blue else red, 120)
@@ -812,7 +840,7 @@ jobs:
                           setTextColor(Color.WHITE)
                           gravity = Gravity.CENTER
                           setOnClickListener { type(ch.toString()); dismissAlt() }
-                      }, LinearLayout.LayoutParams(dp(40), dp(44)))
+                      }, LinearLayout.LayoutParams(dp(40), hdp(44)))
                   }
                   val pw = PopupWindow(rowView, ViewGroup.LayoutParams.WRAP_CONTENT, dp(54))
                   pw.isOutsideTouchable = true
@@ -833,6 +861,7 @@ jobs:
               // ---------------------------------------------------------------- input actions
 
               private fun type(s: String) {
+                  if (s.length == 1 && (s[0].isWhitespace() || s[0] in ".,!?;:)\"")) learnBeforeCursor()
                   val out = if (shift || caps) s.uppercase() else s
                   currentInputConnection?.commitText(out, 1)
                   if (shift && !caps) { shift = false; render() } else updateSuggestions()
@@ -860,6 +889,7 @@ jobs:
               }
 
               private fun onEnter() {
+                  learnBeforeCursor()
                   val ei = currentInputEditorInfo
                   val action = ei?.imeOptions?.and(EditorInfo.IME_MASK_ACTION) ?: EditorInfo.IME_ACTION_NONE
                   val noAction = ei == null ||
@@ -953,6 +983,40 @@ jobs:
 
               // ---------------------------------------------------------------- suggestions
 
+              private fun isPasswordField(): Boolean {
+                  val t = currentInputEditorInfo?.inputType ?: return false
+                  val cls = t and InputType.TYPE_MASK_CLASS
+                  val v = t and InputType.TYPE_MASK_VARIATION
+                  return (cls == InputType.TYPE_CLASS_TEXT && (v == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+                      v == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
+                      v == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD)) ||
+                      (cls == InputType.TYPE_CLASS_NUMBER && v == InputType.TYPE_NUMBER_VARIATION_PASSWORD)
+              }
+
+              /** The word being typed, and the word before it (if separated by a space). */
+              private fun wordContext(): Pair<String, String> {
+                  val before = currentInputConnection?.getTextBeforeCursor(60, 0)?.toString().orEmpty()
+                  val word = before.takeLastWhile { it.isLetter() || it == '\'' }
+                  val rest = before.dropLast(word.length)
+                  val prev = if (rest.isNotEmpty() && rest.last().isWhitespace())
+                      rest.trimEnd().takeLastWhile { it.isLetter() || it == '\'' } else ""
+                  return word to prev
+              }
+
+              private fun learnBeforeCursor() {
+                  if (isPasswordField()) return
+                  val (w, p) = wordContext()
+                  if (w.length >= 2) model.learn(w, p)
+              }
+
+              private fun pick(s: String, word: String, prev: String) {
+                  val ic = currentInputConnection ?: return
+                  ic.deleteSurroundingText(word.length, 0)
+                  ic.commitText("$s ", 1)
+                  model.learn(s, prev)
+                  if (shift && !caps) { shift = false; render() } else updateSuggestions()
+              }
+
               private fun updateSuggestions() {
                   val row = suggestionRow ?: return
                   row.removeAllViews()
@@ -970,35 +1034,51 @@ jobs:
                           render()
                       }
                   }, LinearLayout.LayoutParams(dp(52), MATCH))
+                  if (isPasswordField()) return
 
-                  val before = currentInputConnection?.getTextBeforeCursor(30, 0)?.toString().orEmpty()
-                  val word = before.takeLastWhile { it.isLetter() }
-                  val pool = if (filipino) FIL_WORDS + EN_WORDS else EN_WORDS + FIL_WORDS
-                  val list = if (word.isEmpty()) {
-                      if (filipino) listOf("po", "opo", "salamat") else listOf("I", "the", "and")
-                  } else {
-                      pool.filter { it.startsWith(word, true) && !it.equals(word, true) }.distinct().take(3)
+                  val (word, prev) = wordContext()
+                  val raw = model.suggest(word, prev, filipino, 3)
+                  val allCaps = word.length > 1 && word.all { !it.isLetter() || it.isUpperCase() }
+                  val cap = word.firstOrNull()?.isUpperCase() == true || (word.isEmpty() && shift)
+                  val list = raw.map { s ->
+                      when {
+                          allCaps -> s.uppercase()
+                          cap -> s.replaceFirstChar { it.uppercase() }
+                          else -> s
+                      }
                   }
-                  val capitalize = word.firstOrNull()?.isUpperCase() == true
-                  list.forEachIndexed { i, s ->
-                      val shown = if (capitalize) s.replaceFirstChar { it.uppercase() } else s
+                  // Best suggestion in the middle, like Gboard
+                  for (pos in 0..2) {
+                      val s = when (pos) {
+                          0 -> list.getOrNull(1)
+                          1 -> list.getOrNull(0)
+                          else -> list.getOrNull(2)
+                      }
                       row.addView(View(this).apply { setBackgroundColor(Color.argb(90, 255, 23, 68)) },
                           LinearLayout.LayoutParams(dp(1), dp(18)))
                       row.addView(TextView(this).apply {
-                          text = shown
+                          text = s ?: ""
                           setTextColor(Color.WHITE)
                           textSize = 15f
                           gravity = Gravity.CENTER
-                          setOnClickListener {
-                              val ic = currentInputConnection ?: return@setOnClickListener
-                              ic.deleteSurroundingText(word.length, 0)
-                              ic.commitText("$shown ", 1)
-                          }
+                          if (pos == 1) typeface = Typeface.DEFAULT_BOLD
+                          if (s != null) setOnClickListener { pick(s, word, prev) }
                       }, LinearLayout.LayoutParams(0, MATCH, 1f))
                   }
               }
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun isLandscape() =
+                  resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+
+              /** Panel sizes shrink in landscape so the keyboard doesn't cover the screen. */
+              private fun hdp(v: Int) = (dp(v) * if (isLandscape()) 0.72f else 1f).toInt()
+
+              private fun kbHeight(): Int {
+                  val h = resources.displayMetrics.heightPixels
+                  return if (isLandscape()) minOf(dp(KB_HEIGHT), (h * 0.58f).toInt()) else dp(KB_HEIGHT)
+              }
 
               companion object {
                   val EMOJI = listOf(
@@ -1040,9 +1120,9 @@ jobs:
           }
 
           /** Forces the keyboard to a fixed height so the keys don't stretch to fill the screen. */
-          private class FixedHeightFrame(ctx: Context, private val fixedHeight: Int) : FrameLayout(ctx) {
+          private class FixedHeightFrame(ctx: Context, private val heightPx: () -> Int) : FrameLayout(ctx) {
               override fun onMeasure(widthSpec: Int, heightSpec: Int) {
-                  super.onMeasure(widthSpec, View.MeasureSpec.makeMeasureSpec(fixedHeight, View.MeasureSpec.EXACTLY))
+                  super.onMeasure(widthSpec, View.MeasureSpec.makeMeasureSpec(heightPx(), View.MeasureSpec.EXACTLY))
               }
           }
           KBEOF
@@ -1183,7 +1263,7 @@ jobs:
                   colors = when (mode) {
                       2 -> intArrayOf(Color.RED, Color.YELLOW, Color.GREEN, Color.CYAN, Color.BLUE, Color.MAGENTA, Color.RED)
                       1 -> {
-                          val blue = Color.parseColor("#2979FF")
+                          val blue = Color.parseColor("#5CC8FF")
                           intArrayOf(accent, blue, accent, blue, accent)
                       }
                       else -> {
@@ -1258,7 +1338,7 @@ jobs:
           class SettingsActivity : ComponentActivity() {
 
               private val red = Color.parseColor("#FF1744")
-              private val blue = Color.parseColor("#2979FF")
+              private val blue = Color.parseColor("#5CC8FF")
 
               private val picker =
                   registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -1350,6 +1430,11 @@ jobs:
                       setHintTextColor(Color.GRAY)
                       setTextColor(Color.WHITE)
                   })
+                  val names = assets.list("") ?: emptyArray()
+                  val enOk = names.contains("en_50k.txt")
+                  val tlOk = names.contains("tl_50k.txt")
+                  col.addView(label("Dictionary: English " + (if (enOk) "✔ large" else "built-in (small)") +
+                      " · Filipino " + (if (tlOk) "✔ large" else "built-in (small)")))
                   col.addView(label("Tips: tap ⋯ on the suggestion bar for tools (images, clipboard, cut/copy/paste, cursor keys, one-handed mode). Hold a letter for accents, e.g. n → ñ."))
 
                   setContentView(ScrollView(this).apply {
@@ -1426,6 +1511,243 @@ jobs:
               }
           }
           KBEOF
+          mkdir -p app/src/main/java/com/example/customkeyboard
+          cat > app/src/main/java/com/example/customkeyboard/WordModel.kt <<'KBEOF'
+          package com.example.customkeyboard
+
+          import android.content.Context
+          import java.util.Collections
+          import java.util.PriorityQueue
+          import kotlin.math.abs
+
+          /**
+           * Word prediction: big frequency dictionaries (from app assets when present),
+           * plus words and word pairs learned from what the user types.
+           */
+          class WordModel(
+              private val ctx: Context,
+              private val builtinEn: List<String>,
+              private val builtinFil: List<String>
+          ) {
+              private class Dict(val words: Array<String>) {
+                  private val sorted: Array<String>
+                  private val rankOf: IntArray
+
+                  init {
+                      val idx = words.indices.sortedBy { words[it] }
+                      sorted = Array(idx.size) { words[idx[it]] }
+                      rankOf = IntArray(idx.size) { idx[it] }
+                  }
+
+                  /** Ranks (0 = most common) of the best words starting with [p]. */
+                  fun complete(p: String, limit: Int): List<Int> {
+                      var lo = 0
+                      var hi = sorted.size
+                      while (lo < hi) {
+                          val mid = (lo + hi) ushr 1
+                          if (sorted[mid] < p) lo = mid + 1 else hi = mid
+                      }
+                      val best = PriorityQueue<Int>(limit + 1, Collections.reverseOrder<Int>())
+                      var i = lo
+                      while (i < sorted.size && sorted[i].startsWith(p)) {
+                          if (sorted[i] != p) {
+                              best.add(rankOf[i])
+                              if (best.size > limit) best.poll()
+                          }
+                          i++
+                      }
+                      return best.sorted()
+                  }
+
+                  /** Common words one typo away from [p] (substitution, missing/extra letter, swap). */
+                  fun fuzzy(p: String, limit: Int): List<Int> {
+                      val out = ArrayList<Int>()
+                      for (r in words.indices) {
+                          val w = words[r]
+                          if (abs(w.length - p.length) <= 1 && near(w, p)) {
+                              out.add(r)
+                              if (out.size >= limit) break
+                          }
+                      }
+                      return out
+                  }
+              }
+
+              @Volatile private var en = Dict(builtinEn.map { it.lowercase() }.toTypedArray())
+              @Volatile private var fil = Dict(builtinFil.map { it.lowercase() }.toTypedArray())
+
+              private val prefs = ctx.getSharedPreferences("words", Context.MODE_PRIVATE)
+              private val user = HashMap<String, Int>()
+              private val next = HashMap<String, HashMap<String, Int>>()
+              private var dirty = false
+
+              init { loadUser() }
+
+              /** Call off the main thread: reads the large dictionaries if they were bundled. */
+              fun load() {
+                  readDict("en_50k.txt", 30000, BLOCK_EN)?.let { en = it }
+                  readDict("tl_50k.txt", 20000, BLOCK_FIL)?.let { fil = it }
+              }
+
+              private fun readDict(asset: String, max: Int, block: Set<String>): Dict? = try {
+                  val out = ArrayList<String>()
+                  ctx.assets.open(asset).bufferedReader().useLines { lines ->
+                      for (ln in lines) {
+                          val w = ln.substringBefore(' ').trim().lowercase()
+                          if ((w.length >= 2 || w == "a" || w == "i") && w.length <= 20 &&
+                              w.all { it.isLetter() || it == '\'' } && w !in block
+                          ) out.add(w)
+                          if (out.size >= max) break
+                      }
+                  }
+                  if (out.size < 500) null else Dict(out.distinct().toTypedArray())
+              } catch (e: Exception) {
+                  null
+              }
+
+              fun suggest(prefix: String, prev: String, filipino: Boolean, limit: Int): List<String> {
+                  val p = prefix.lowercase()
+                  if (p.isEmpty()) return nextWords(prev.lowercase(), filipino, limit)
+
+                  val scores = HashMap<String, Double>()
+                  for ((w, c) in user) {
+                      if (c >= 2 && w.length > p.length && w.startsWith(p)) scores[w] = 200000.0 + c
+                  }
+                  val primary = if (filipino) fil else en
+                  val secondary = if (filipino) en else fil
+                  for (r in primary.complete(p, 6)) {
+                      val w = primary.words[r]
+                      scores[w] = maxOf(scores[w] ?: 0.0, 100000.0 - r)
+                  }
+                  for (r in secondary.complete(p, 4)) {
+                      val w = secondary.words[r]
+                      scores[w] = maxOf(scores[w] ?: 0.0, 80000.0 - r)
+                  }
+                  var out = scores.entries.sortedByDescending { it.value }.map { it.key }.take(limit)
+                  if (out.size < limit && p.length >= 3) {
+                      val extra = primary.fuzzy(p, limit).map { primary.words[it] } +
+                          secondary.fuzzy(p, 2).map { secondary.words[it] }
+                      out = (out + extra.filter { it != p }).distinct().take(limit)
+                  }
+                  return out
+              }
+
+              private fun nextWords(prev: String, filipino: Boolean, limit: Int): List<String> {
+                  val out = ArrayList<String>()
+                  fun addWord(w: String) {
+                      if (out.size < limit && out.none { it.equals(w, true) }) out.add(w)
+                  }
+                  if (prev.isNotEmpty()) {
+                      next[prev]?.entries?.sortedByDescending { it.value }?.forEach { addWord(it.key) }
+                      SEEDS[prev]?.forEach { addWord(it) }
+                  }
+                  val defaults = if (filipino) listOf("po", "opo", "salamat", "ako", "ikaw", "sige")
+                  else listOf("I", "the", "and", "to", "you", "it")
+                  defaults.forEach { addWord(it) }
+                  return out
+              }
+
+              fun learn(word: String, prev: String) {
+                  val w = word.lowercase()
+                  if (w.length < 2) return
+                  user[w] = (user[w] ?: 0) + 1
+                  if (prev.isNotEmpty()) {
+                      val m = next.getOrPut(prev.lowercase()) { HashMap() }
+                      m[w] = (m[w] ?: 0) + 1
+                  }
+                  dirty = true
+              }
+
+              fun save() {
+                  if (!dirty) return
+                  dirty = false
+                  val u = user.entries.sortedByDescending { it.value }.take(5000)
+                      .joinToString("\n") { "${it.key}\t${it.value}" }
+                  val n = ArrayList<Triple<String, String, Int>>()
+                  for ((a, m) in next) for ((b, c) in m) n.add(Triple(a, b, c))
+                  val ns = n.sortedByDescending { it.third }.take(6000)
+                      .joinToString("\n") { "${it.first}\t${it.second}\t${it.third}" }
+                  prefs.edit().putString("user", u).putString("next", ns).apply()
+              }
+
+              private fun loadUser() {
+                  prefs.getString("user", "")?.lineSequence()?.forEach { ln ->
+                      val p = ln.split('\t')
+                      if (p.size == 2) p[1].toIntOrNull()?.let { user[p[0]] = it }
+                  }
+                  prefs.getString("next", "")?.lineSequence()?.forEach { ln ->
+                      val p = ln.split('\t')
+                      if (p.size == 3) p[2].toIntOrNull()?.let { next.getOrPut(p[0]) { HashMap() }[p[1]] = it }
+                  }
+              }
+
+              companion object {
+                  private fun near(a: String, b: String): Boolean {
+                      if (a == b) return false
+                      val la = a.length
+                      val lb = b.length
+                      if (abs(la - lb) > 1) return false
+                      if (la == lb) {
+                          var i = 0
+                          while (i < la && a[i] == b[i]) i++
+                          if (i == la) return false
+                          if (a.substring(i + 1) == b.substring(i + 1)) return true
+                          return i + 1 < la && a[i] == b[i + 1] && a[i + 1] == b[i] &&
+                              a.substring(i + 2) == b.substring(i + 2)
+                      }
+                      val s = if (la < lb) a else b
+                      val l = if (la < lb) b else a
+                      var i = 0
+                      while (i < s.length && s[i] == l[i]) i++
+                      return s.substring(i) == l.substring(i + 1)
+                  }
+
+                  private val BLOCK_EN = setOf(
+                      "fuck", "fucks", "fucked", "fucking", "fucker", "shit", "shitty", "bitch", "bitches",
+                      "bastard", "asshole", "dick", "dicks", "pussy", "cock", "cunt", "whore", "slut",
+                      "nigger", "nigga", "faggot", "fag", "retard", "retarded"
+                  )
+                  private val BLOCK_FIL = BLOCK_EN + setOf(
+                      "putangina", "putang", "tangina", "puta", "tarantado", "kantot", "pakyu", "pokpok",
+                      "burat", "puke", "titi", "bayag"
+                  )
+
+                  private val SEEDS = mapOf(
+                      "i" to listOf("am", "have", "think", "don't"),
+                      "thank" to listOf("you"),
+                      "how" to listOf("are", "to", "do"),
+                      "you" to listOf("are", "can", "know"),
+                      "do" to listOf("you", "not", "i"),
+                      "what" to listOf("is", "are", "do"),
+                      "good" to listOf("morning", "night", "luck"),
+                      "see" to listOf("you", "the"),
+                      "in" to listOf("the", "a"),
+                      "of" to listOf("the", "a"),
+                      "to" to listOf("the", "be", "do"),
+                      "it" to listOf("is", "was"),
+                      "is" to listOf("it", "a", "the"),
+                      "are" to listOf("you", "we"),
+                      "will" to listOf("be", "do"),
+                      "have" to listOf("a", "to", "been"),
+                      "can" to listOf("you", "i"),
+                      "let" to listOf("me", "us"),
+                      "hello" to listOf("there", "po"),
+                      "salamat" to listOf("po", "sa", "din"),
+                      "kumusta" to listOf("ka", "na", "po"),
+                      "magandang" to listOf("umaga", "gabi", "hapon"),
+                      "ako" to listOf("ay", "po", "na"),
+                      "hindi" to listOf("ko", "po", "na"),
+                      "sige" to listOf("po", "na", "lang"),
+                      "ikaw" to listOf("ba", "na", "ang"),
+                      "ano" to listOf("ba", "po", "ang"),
+                      "ingat" to listOf("po", "ka", "kayo"),
+                      "mahal" to listOf("kita", "ko", "na"),
+                      "gusto" to listOf("ko", "kong", "mo"),
+                      "pwede" to listOf("ba", "po", "ko")
+                  )
+              }
+          }
+          KBEOF
           mkdir -p app/src/main/res/drawable
           cat > app/src/main/res/drawable/ic_launcher.xml <<'KBEOF'
           <?xml version="1.0" encoding="utf-8"?>
@@ -1478,6 +1800,13 @@ jobs:
           rootProject.name = "CustomKeyboard"
           include(":app")
           KBEOF
+      - name: Download word lists
+        run: |
+          mkdir -p app/src/main/assets
+          BASE=https://raw.githubusercontent.com/hermitdave/FrequencyWords/master/content/2018
+          curl -fsSL --retry 3 -o app/src/main/assets/en_50k.txt $BASE/en/en_50k.txt || echo "English word list download failed"
+          curl -fsSL --retry 3 -o app/src/main/assets/tl_50k.txt $BASE/tl/tl_50k.txt || echo "Filipino word list download failed"
+          ls -l app/src/main/assets
       - name: Build
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
